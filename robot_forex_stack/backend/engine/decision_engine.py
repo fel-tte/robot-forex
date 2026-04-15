@@ -248,9 +248,10 @@ class DecisionEngine:
         total_pnl    = 0.0
         total_mae    = 0.0
 
-        # Deterministic seed so same market state → same simulation
+        # Seed combines entry_price AND current monotonic time counter so that
+        # the same price level at different times produces different paths.
         rng = np.random.default_rng(
-            seed=int(abs(entry_price * 10_000)) % (2 ** 31)
+            seed=(int(abs(entry_price * 10_000)) ^ int(time.monotonic() * 1000)) % (2 ** 31)
         )
 
         for _ in range(_MC_PATHS):
