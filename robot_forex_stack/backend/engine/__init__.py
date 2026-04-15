@@ -6,6 +6,7 @@ from .trade_manager import TradeManager
 from .session_manager import SessionManager, TradingSession
 from .data_provider import MockDataProvider
 from .ctrader_provider import CTraderDataProvider, BrokerStatus
+from .auto_pilot import AutoPilot, AutoPilotDecision, ScoredCandidate
 
 __all__ = [
     "WaveDetector", "WaveState",
@@ -16,4 +17,5 @@ __all__ = [
     "SessionManager", "TradingSession",
     "MockDataProvider",
     "CTraderDataProvider", "BrokerStatus",
+    "AutoPilot", "AutoPilotDecision", "ScoredCandidate",
 ]

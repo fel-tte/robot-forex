@@ -37,12 +37,16 @@ from engine import (
     SessionManager, TradingSession,
     MockDataProvider,
     CTraderDataProvider, BrokerStatus,
+    AutoPilot,
 )
 from engine.signal_coordinator import TradeSignal as CoordSignal
 from engine.risk_manager import RiskConfig, MartingaleConfig
 from engine.trade_manager import PartialCloseConfig, TrailingConfig, GridConfig
 from engine.session_manager import DSTMode
 from models.schemas import (
+    AutoPilotStatusSchema,
+    AutoPilotLastDecisionSchema,
+    AutoPilotCandidateSchema,
     BrokerStatusSchema,
     CandleSchema,
     PaginatedTrades,
@@ -107,6 +111,7 @@ class AppState:
         self.entry_logic: EntryLogic = EntryLogic()
         self.trade_manager: TradeManager = TradeManager()
         self.session_manager: SessionManager = SessionManager()
+        self.auto_pilot: AutoPilot = AutoPilot()
 
         self._ws_clients: Set[WebSocket] = set()
         self._engine_task: Optional[asyncio.Task] = None
@@ -189,6 +194,15 @@ class AppState:
             dst_mode=DSTMode(s.dst_mode),
             gmt_offset=s.gmt_offset,
         )
+        self.auto_pilot = AutoPilot(
+            sl_mode=SLMode(s.sl_mode),
+            sl_value=s.sl_value,
+            tp_mode=TPMode(s.tp_mode),
+            tp_value=s.tp_value,
+            retrace_atr_mult=s.retrace_atr_mult,
+            min_body_atr=s.min_body_atr,
+            retest_level_x=s.retest_level_x,
+        )
         self.coordinator.set_execute_callback(self._on_signal_execute)
 
     async def _on_signal_execute(self, signal: CoordSignal) -> None:
@@ -264,6 +278,18 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     app_state.rebuild_components()
+
+    # ── AUTO-START: Robot tự vận hành ngay khi khởi động ──────────────── #
+    # Hệ thống tự quyết định và bắt đầu trading ngay khi server khởi động.
+    # Không cần gọi /api/robot/start thủ công.
+    # Để tắt tính năng này, gọi POST /api/robot/stop sau khi server khởi động.
+    app_state.robot_running = True
+    app_state.start_time = time.time()
+    app_state.coordinator.start()
+    app_state._engine_task = asyncio.create_task(_engine.run())
+    logger.info("AutoPilot: robot đã tự khởi động — đang vận hành tự động.")
+    # ──────────────────────────────────────────────────────────────────── #
+
     yield
     # Shutdown
     if app_state._engine_task:
@@ -284,24 +310,25 @@ app.add_middleware(
 
 class RobotEngine:
     """
-    Async background engine loop.
-    Every tick:
-      1. Get latest candles from MockDataProvider
-      2. Run WaveDetector
-      3. If session + wave + risk allow: generate signal, submit to coordinator
-      4. Coordinator processes queue
-      5. Update open trades (SL/TP/trailing/partial)
-      6. Persist closed trades, update equity
+    Async background engine — tự vận hành hoàn toàn.
+
+    Mỗi tick (interval tự điều chỉnh):
+      1. Quản lý lệnh đang mở (SL/TP/trailing/partial) — LUÔN ưu tiên trước.
+      2. Tính equity thực tế, kiểm tra drawdown.
+      3. AutoPilot scan tất cả EntryModes, chọn setup tốt nhất.
+      4. Nếu setup đủ điểm → submit signal với dynamic priority.
+      5. Coordinator xử lý queue, execute lệnh tốt nhất.
+      6. Broadcast live update qua WebSocket.
     """
 
     def __init__(self, state: AppState) -> None:
         self.state = state
-        self._tick_interval = 5.0   # seconds between ticks
+        self._tick_interval = 5.0   # tự điều chỉnh bởi AutoPilot
         self._daily_trades = 0
         self._last_day: Optional[int] = None
 
     async def run(self) -> None:
-        logger.info("RobotEngine started")
+        logger.info("RobotEngine (AutoPilot) started")
         while True:
             try:
                 await self._tick()
@@ -310,6 +337,8 @@ class RobotEngine:
                 break
             except Exception as exc:
                 logger.error("Engine tick error: %s", exc, exc_info=True)
+            # Dùng tick interval do AutoPilot tự điều chỉnh
+            self._tick_interval = self.state.auto_pilot.get_current_tick_interval()
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
@@ -413,9 +442,10 @@ class RobotEngine:
             spread_ok = self.state.risk_manager.check_spread(s.symbol, s.max_spread)
 
             if spread_ok:
-                await self._try_generate_signal(df, wave_analysis, atr, current_price)
+                await self._autopilot_generate_signal(df, wave_analysis, atr, current_price)
 
-        # Broadcast live update
+        # Broadcast live update (thêm autopilot info)
+        ap_dec = self.state.auto_pilot.last_decision
         await self.state.broadcast({
             "event": "tick",
             "wave": wave_analysis.main_wave,
@@ -427,61 +457,61 @@ class RobotEngine:
             "open_trades": open_count,
             "coordinator_state": self.state.coordinator.state.value,
             "timestamp": time.time(),
+            "autopilot": {
+                "tick_interval": self.state.auto_pilot.get_current_tick_interval(),
+                "last_action": ap_dec.action if ap_dec else "IDLE",
+                "last_mode": ap_dec.best_mode if ap_dec else None,
+                "last_score": ap_dec.best_score if ap_dec else 0.0,
+                "signals_generated": self.state.auto_pilot.signals_generated,
+            },
         })
 
-    async def _try_generate_signal(
+    async def _autopilot_generate_signal(
         self, df, wave_analysis, atr: float, current_price: float
     ) -> None:
+        """AutoPilot: tự chọn entry mode tốt nhất, tự set priority."""
         s = self.state.settings
-        candle = df.iloc[-1]
-        prev_candle = df.iloc[-2]
 
-        # Get range high/low (last N candles as proxy for ORB)
+        # Range boundaries (ORB proxy)
         n_range = max(4, s.monitoring_minutes // 5)
         range_df = df.iloc[-n_range - 1 : -1]
         range_high = float(range_df["high"].max())
         range_low = float(range_df["low"].min())
 
-        # Swing points from wave analysis
-        swing_high = (
-            self.state.wave_detector.last_analysis.swing_highs[-1].price
-            if self.state.wave_detector.last_analysis and self.state.wave_detector.last_analysis.swing_highs
-            else 0.0
-        )
-        swing_low = (
-            self.state.wave_detector.last_analysis.swing_lows[-1].price
-            if self.state.wave_detector.last_analysis and self.state.wave_detector.last_analysis.swing_lows
-            else 0.0
-        )
-
-        direction = self.state.entry_logic.check_entry(
-            candle, range_high, range_low, atr, float(prev_candle["close"])
-        )
-        if direction is None:
-            return
-
-        # EMA filter
-        if s.ema_filter_enabled:
-            if not self.state.wave_detector.can_trade(direction, wave_analysis):
-                return
+        # Swing points
+        wa_cache = self.state.wave_detector.last_analysis
+        swing_high = wa_cache.swing_highs[-1].price if wa_cache and wa_cache.swing_highs else 0.0
+        swing_low  = wa_cache.swing_lows[-1].price  if wa_cache and wa_cache.swing_lows  else 0.0
 
         lot_size = self.state.risk_manager.calculate_lot_size(
             self.state.balance, self.state.equity
         )
 
-        entry_signal = self.state.entry_logic.build_entry_signal(
-            signal_id=str(uuid.uuid4())[:8],
-            symbol=s.symbol,
-            direction=direction,
-            entry_price=current_price,
-            lot_size=lot_size,
+        # ── AutoPilot: scan & score ──────────────────────────────────── #
+        best, decision = self.state.auto_pilot.select_best_entry(
+            df=df,
+            wave_analysis=wave_analysis,
             atr=atr,
+            current_price=current_price,
+            symbol=s.symbol,
+            lot_size=lot_size,
             swing_high=swing_high,
             swing_low=swing_low,
             range_high=range_high,
             range_low=range_low,
-            prev_high=float(prev_candle["high"]),
-            prev_low=float(prev_candle["low"]),
+        )
+
+        if best is None:
+            logger.debug("AutoPilot: không có setup hợp lệ trên tick này.")
+            return
+
+        entry_signal = best.entry_signal
+        priority = self.state.auto_pilot.score_to_priority(best.score)
+
+        logger.info(
+            "AutoPilot → mode=%-20s dir=%s score=%.3f rr=%.2f priority=%d",
+            best.entry_mode, best.direction, best.score,
+            entry_signal.risk_reward, priority,
         )
 
         coord_signal = CoordSignal(
@@ -493,9 +523,10 @@ class RobotEngine:
             tp=entry_signal.tp,
             lot_size=entry_signal.lot_size,
             entry_mode=entry_signal.entry_mode,
+            priority=priority,
         )
         result = self.state.coordinator.submit_signal(coord_signal)
-        logger.debug("Signal %s: %s", entry_signal.signal_id, result)
+        logger.debug("AutoPilot signal %s: %s", entry_signal.signal_id, result)
 
         if "QUEUED" in result:
             await self.state.coordinator.process_next(
@@ -681,6 +712,46 @@ async def get_risk_metrics():
         dd_triggered=app_state.risk_manager.dd_triggered,
         open_trades=len(app_state.trade_manager.get_open_trades()),
         spread=spread,
+    )
+
+
+# ── AutoPilot status ───────────────────────────────────────────────────── #
+
+def _format_ap_decision(d) -> AutoPilotLastDecisionSchema:
+    top = [
+        AutoPilotCandidateSchema(
+            mode=c["mode"], direction=c["dir"], score=c["score"]
+        )
+        for c in d.meta.get("all_candidates", [])
+    ]
+    return AutoPilotLastDecisionSchema(
+        timestamp=d.timestamp,
+        candidates_evaluated=d.candidates_evaluated,
+        candidates_passed=d.candidates_passed,
+        best_mode=d.best_mode,
+        best_direction=d.best_direction,
+        best_score=d.best_score,
+        action=d.action,
+        signal_id=d.signal_id,
+        tick_interval=d.tick_interval,
+        top_candidates=top,
+    )
+
+
+@app.get("/api/autopilot/status", response_model=AutoPilotStatusSchema)
+async def get_autopilot_status():
+    """Trạng thái chi tiết của AutoPilot — quyết định, điểm, entry modes đã scan."""
+    ap = app_state.auto_pilot
+    last = _format_ap_decision(ap.last_decision) if ap.last_decision else None
+    recent = [_format_ap_decision(d) for d in ap.history[:10]]
+    return AutoPilotStatusSchema(
+        enabled=True,
+        current_tick_interval=ap.get_current_tick_interval(),
+        decisions_total=ap.decisions_total,
+        signals_generated=ap.signals_generated,
+        min_score_threshold=ap.min_score,
+        last_decision=last,
+        recent_decisions=recent,
     )
 
 

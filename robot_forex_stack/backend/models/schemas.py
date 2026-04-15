@@ -225,6 +225,35 @@ class CandleSchema(BaseModel):
     datetime: str = ""
 
 
+class AutoPilotCandidateSchema(BaseModel):
+    mode: str
+    direction: str
+    score: float
+
+
+class AutoPilotLastDecisionSchema(BaseModel):
+    timestamp: float
+    candidates_evaluated: int
+    candidates_passed: int
+    best_mode: Optional[str] = None
+    best_direction: Optional[str] = None
+    best_score: float
+    action: str
+    signal_id: Optional[str] = None
+    tick_interval: float
+    top_candidates: List[AutoPilotCandidateSchema] = []
+
+
+class AutoPilotStatusSchema(BaseModel):
+    enabled: bool
+    current_tick_interval: float
+    decisions_total: int
+    signals_generated: int
+    min_score_threshold: float
+    last_decision: Optional[AutoPilotLastDecisionSchema] = None
+    recent_decisions: List[AutoPilotLastDecisionSchema] = []
+
+
 class BrokerStatusSchema(BaseModel):
     provider_type: str                    # MOCK | CTRADER
     connected: bool
