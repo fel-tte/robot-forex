@@ -241,6 +241,7 @@ class AutoPilotLastDecisionSchema(BaseModel):
     action: str
     signal_id: Optional[str] = None
     tick_interval: float
+    via_retracement: bool = False
     top_candidates: List[AutoPilotCandidateSchema] = []
 
 
@@ -252,6 +253,35 @@ class AutoPilotStatusSchema(BaseModel):
     min_score_threshold: float
     last_decision: Optional[AutoPilotLastDecisionSchema] = None
     recent_decisions: List[AutoPilotLastDecisionSchema] = []
+
+
+class SupportResistanceLevelSchema(BaseModel):
+    price: float
+    strength: float
+    sr_type: str
+    touch_count: int
+
+
+class RetracementStatusSchema(BaseModel):
+    """Trạng thái real-time của Retracement Engine — dành cho operator giám sát."""
+    in_retracement:  bool
+    main_direction:  str
+    zone:            str       # NOT_RETRACING | SHALLOW | GOLDEN_ZONE | DEEP | STRUCTURE_BROKEN
+    retrace_pct:     float     # phần trăm đã hồi (0.0–1.0)
+    nearest_fib:     str       # "0.382", "0.500", "0.618", etc.
+    quality:         float     # 0.0–1.0
+    bounce_detected: bool
+    impulse_start:   float
+    impulse_end:     float
+    current_price:   float
+    safest_entry:    float
+    safest_sl:       float
+    safest_tp:       float
+    tp_extension:    float
+    risk_reward:     float
+    fib_levels:      Dict[str, float] = {}
+    sr_levels:       List[SupportResistanceLevelSchema] = []
+    description:     str = ""
 
 
 class BrokerStatusSchema(BaseModel):

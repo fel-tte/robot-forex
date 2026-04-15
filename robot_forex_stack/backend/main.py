@@ -38,6 +38,7 @@ from engine import (
     MockDataProvider,
     CTraderDataProvider, BrokerStatus,
     AutoPilot,
+    RetracementEngine,
 )
 from engine.signal_coordinator import TradeSignal as CoordSignal
 from engine.risk_manager import RiskConfig, MartingaleConfig
@@ -47,6 +48,8 @@ from models.schemas import (
     AutoPilotStatusSchema,
     AutoPilotLastDecisionSchema,
     AutoPilotCandidateSchema,
+    RetracementStatusSchema,
+    SupportResistanceLevelSchema,
     BrokerStatusSchema,
     CandleSchema,
     PaginatedTrades,
@@ -112,6 +115,7 @@ class AppState:
         self.trade_manager: TradeManager = TradeManager()
         self.session_manager: SessionManager = SessionManager()
         self.auto_pilot: AutoPilot = AutoPilot()
+        self.retracement_engine: RetracementEngine = RetracementEngine()
 
         self._ws_clients: Set[WebSocket] = set()
         self._engine_task: Optional[asyncio.Task] = None
@@ -203,6 +207,10 @@ class AppState:
             min_body_atr=s.min_body_atr,
             retest_level_x=s.retest_level_x,
         )
+        # RetracementEngine — created inside AutoPilot and aliased here for
+        # direct access from endpoints. Both references point to the same object;
+        # AutoPilot is the sole owner and caller of .measure().
+        self.retracement_engine = self.auto_pilot.retracement_engine
         self.coordinator.set_execute_callback(self._on_signal_execute)
 
     async def _on_signal_execute(self, signal: CoordSignal) -> None:
@@ -444,8 +452,9 @@ class RobotEngine:
             if spread_ok:
                 await self._autopilot_generate_signal(df, wave_analysis, atr, current_price)
 
-        # Broadcast live update (thêm autopilot info)
+        # Broadcast live update (thêm autopilot + retracement info)
         ap_dec = self.state.auto_pilot.last_decision
+        rm = self.state.retracement_engine.last_measure
         await self.state.broadcast({
             "event": "tick",
             "wave": wave_analysis.main_wave,
@@ -462,7 +471,16 @@ class RobotEngine:
                 "last_action": ap_dec.action if ap_dec else "IDLE",
                 "last_mode": ap_dec.best_mode if ap_dec else None,
                 "last_score": ap_dec.best_score if ap_dec else 0.0,
+                "via_retracement": ap_dec.via_retracement if ap_dec else False,
                 "signals_generated": self.state.auto_pilot.signals_generated,
+            },
+            "retracement": {
+                "in_retracement": rm.in_retracement if rm else False,
+                "zone": rm.zone.value if rm else "NOT_RETRACING",
+                "retrace_pct": round(rm.retrace_pct * 100, 1) if rm else 0.0,
+                "quality": rm.quality if rm else 0.0,
+                "bounce": rm.bounce_detected if rm else False,
+                "nearest_fib": rm.nearest_fib if rm else "",
             },
         })
 
@@ -734,6 +752,7 @@ def _format_ap_decision(d) -> AutoPilotLastDecisionSchema:
         action=d.action,
         signal_id=d.signal_id,
         tick_interval=d.tick_interval,
+        via_retracement=d.via_retracement,
         top_candidates=top,
     )
 
@@ -752,6 +771,64 @@ async def get_autopilot_status():
         min_score_threshold=ap.min_score,
         last_decision=last,
         recent_decisions=recent,
+    )
+
+
+@app.get("/api/retracement/status", response_model=RetracementStatusSchema)
+async def get_retracement_status():
+    """
+    Trạng thái real-time của Retracement Engine.
+    Operator giám sát: sóng hồi đang ở zone nào, quality bao nhiêu,
+    điểm vào/SL/TP an toàn nhất là gì.
+    """
+    rm = app_state.retracement_engine.last_measure
+    if rm is None:
+        return RetracementStatusSchema(
+            in_retracement=False,
+            main_direction="BUY",
+            zone="NOT_RETRACING",
+            retrace_pct=0.0,
+            nearest_fib="0.500",
+            quality=0.0,
+            bounce_detected=False,
+            impulse_start=0.0,
+            impulse_end=0.0,
+            current_price=0.0,
+            safest_entry=0.0,
+            safest_sl=0.0,
+            safest_tp=0.0,
+            tp_extension=0.0,
+            risk_reward=0.0,
+        )
+
+    sr_schemas = [
+        SupportResistanceLevelSchema(
+            price=s.price,
+            strength=s.strength,
+            sr_type=s.sr_type,
+            touch_count=s.touch_count,
+        )
+        for s in rm.sr_levels
+    ]
+    return RetracementStatusSchema(
+        in_retracement=rm.in_retracement,
+        main_direction=rm.main_direction,
+        zone=rm.zone.value,
+        retrace_pct=round(rm.retrace_pct, 4),
+        nearest_fib=rm.nearest_fib,
+        quality=rm.quality,
+        bounce_detected=rm.bounce_detected,
+        impulse_start=rm.impulse_start,
+        impulse_end=rm.impulse_end,
+        current_price=rm.current_price,
+        safest_entry=rm.safest_entry,
+        safest_sl=rm.safest_sl,
+        safest_tp=rm.safest_tp,
+        tp_extension=rm.tp_extension,
+        risk_reward=rm.risk_reward,
+        fib_levels=rm.fib_levels,
+        sr_levels=sr_schemas,
+        description=rm.description,
     )
 
 

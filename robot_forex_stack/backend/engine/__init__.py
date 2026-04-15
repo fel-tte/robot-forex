@@ -7,6 +7,7 @@ from .session_manager import SessionManager, TradingSession
 from .data_provider import MockDataProvider
 from .ctrader_provider import CTraderDataProvider, BrokerStatus
 from .auto_pilot import AutoPilot, AutoPilotDecision, ScoredCandidate
+from .retracement_engine import RetracementEngine, RetracementMeasure, SupportResistanceLevel, RetracementZone
 
 __all__ = [
     "WaveDetector", "WaveState",
@@ -18,4 +19,5 @@ __all__ = [
     "MockDataProvider",
     "CTraderDataProvider", "BrokerStatus",
     "AutoPilot", "AutoPilotDecision", "ScoredCandidate",
+    "RetracementEngine", "RetracementMeasure", "SupportResistanceLevel", "RetracementZone",
 ]
