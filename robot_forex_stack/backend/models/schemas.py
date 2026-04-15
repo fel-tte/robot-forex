@@ -305,3 +305,55 @@ class PaginatedTrades(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+# ── Decision Engine schemas ────────────────────────────────────────────── #
+
+class MarketRegimeSchema(BaseModel):
+    continuation_prob: float   # 0–1: probability trend continues
+    volatility_regime: str     # LOW | NORMAL | HIGH | EXTREME
+    momentum_score:    float   # 0–1
+    atr_percentile:    float   # 0–1
+
+
+class SimulatedOutcomeSchema(BaseModel):
+    expected_value:        float
+    win_probability:       float
+    max_adverse_excursion: float
+
+
+class SegmentStatsSchema(BaseModel):
+    win_rate:      float
+    profit_factor: float
+    avg_rr:        float
+    expectancy:    float
+    sample_size:   int
+
+
+class DecisionContextSchema(BaseModel):
+    """Current tick decision context from DecisionEngine."""
+    action:               str              # SCAN_AND_ENTER | HOLD | etc.
+    lot_scale:            float
+    effective_min_score:  float
+    regime:               MarketRegimeSchema
+    adaptive_paused:      bool
+    pause_reason:         str
+    consecutive_losses:   int
+    mode_weight_multipliers: Dict[str, float] = {}
+    meta:                 Dict[str, Any] = {}
+
+
+class DecisionEngineStatusSchema(BaseModel):
+    """Full status of the Decision Engine for operator monitoring."""
+    last_action:          str
+    lot_scale:            float
+    effective_min_score:  float
+    adaptive_paused:      bool
+    pause_reason:         str
+    consecutive_losses:   int
+    adaptation_count:     int
+    regime:               Optional[MarketRegimeSchema] = None
+    global_stats:         SegmentStatsSchema
+    segment_stats:        Dict[str, SegmentStatsSchema] = {}
+    mode_weight_adjs:     Dict[str, float] = {}
+    recent_outcomes:      List[Dict[str, Any]] = []

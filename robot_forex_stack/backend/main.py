@@ -39,6 +39,7 @@ from engine import (
     CTraderDataProvider, BrokerStatus,
     AutoPilot,
     RetracementEngine,
+    DecisionEngine, DecisionAction,
 )
 from engine.signal_coordinator import TradeSignal as CoordSignal
 from engine.risk_manager import RiskConfig, MartingaleConfig
@@ -50,6 +51,10 @@ from models.schemas import (
     AutoPilotCandidateSchema,
     RetracementStatusSchema,
     SupportResistanceLevelSchema,
+    MarketRegimeSchema,
+    SegmentStatsSchema,
+    DecisionContextSchema,
+    DecisionEngineStatusSchema,
     BrokerStatusSchema,
     CandleSchema,
     PaginatedTrades,
@@ -116,6 +121,11 @@ class AppState:
         self.session_manager: SessionManager = SessionManager()
         self.auto_pilot: AutoPilot = AutoPilot()
         self.retracement_engine: RetracementEngine = RetracementEngine()
+        self.decision_engine: DecisionEngine = DecisionEngine()
+
+        # Maps trade_id → {mode, wave_state, retrace_zone, initial_risk}
+        # populated at open, consumed at close for DecisionEngine.record_outcome()
+        self._trade_context: Dict[str, Dict[str, Any]] = {}
 
         self._ws_clients: Set[WebSocket] = set()
         self._engine_task: Optional[asyncio.Task] = None
@@ -211,6 +221,11 @@ class AppState:
         # direct access from endpoints. Both references point to the same object;
         # AutoPilot is the sole owner and caller of .measure().
         self.retracement_engine = self.auto_pilot.retracement_engine
+        # DecisionEngine preserves its PerformanceTracker across rebuilds
+        # (settings change should not erase accumulated learning).
+        self.decision_engine._base_min_score_update(
+            float(getattr(self, "_base_min_score", 0.25))
+        )
         self.coordinator.set_execute_callback(self._on_signal_execute)
 
     async def _on_signal_execute(self, signal: CoordSignal) -> None:
@@ -224,6 +239,17 @@ class AppState:
             lot_size=signal.lot_size,
             entry_mode=signal.entry_mode,
         )
+
+        # Store trade context for DecisionEngine.record_outcome() on close
+        wa = self.wave_detector.last_analysis
+        rm = self.retracement_engine.last_measure
+        initial_risk = abs(signal.entry_price - signal.sl)
+        self._trade_context[trade.trade_id] = {
+            "mode":         signal.entry_mode,
+            "wave_state":   wa.main_wave.value if wa else "SIDEWAYS",
+            "retrace_zone": rm.zone.value if rm else "NOT_RETRACING",
+            "initial_risk": initial_risk,
+        }
         # Persist to DB
         db = SessionLocal()
         try:
@@ -390,15 +416,12 @@ class RobotEngine:
                 trade.trade_id, current_price, atr
             )
             if "closed" in actions:
-                trade_obj = self.state.trade_manager.get_trade(trade.trade_id)
-                # Trade was moved to closed list already
-                # Find it in closed list
                 for ct in self.state.trade_manager.get_closed_trades():
                     if ct.trade_id == trade.trade_id and ct.close_time:
                         closed_this_tick.append(ct)
                         break
 
-        # Persist closed trades and update balance
+        # Persist closed trades, update balance, record outcome for learning
         if closed_this_tick:
             db = SessionLocal()
             try:
@@ -426,12 +449,31 @@ class RobotEngine:
                     self.state.balance += ct.pnl
                     self.state.risk_manager.on_trade_closed(ct.pnl)
                     self.state.coordinator.on_trade_closed(ct.pnl)
+
+                    # ── Tự học: feed outcome to DecisionEngine ─────── #
+                    ctx = self.state._trade_context.pop(ct.trade_id, {})
+                    self.state.decision_engine.record_outcome(
+                        mode=ctx.get("mode", ct.entry_mode),
+                        wave_state=ctx.get("wave_state", "SIDEWAYS"),
+                        direction=ct.direction,
+                        retrace_zone=ctx.get("retrace_zone", "NOT_RETRACING"),
+                        pnl=ct.pnl,
+                        initial_risk=ctx.get("initial_risk", 0.0),
+                    )
             finally:
                 db.close()
 
+        # ── Decision Engine: tự quyết định action + tự dự đoán ──────── #
+        open_count = len(self.state.trade_manager.get_open_trades())
+        decision_ctx = self.state.decision_engine.decide(
+            df=df,
+            wave_analysis=wave_analysis,
+            atr=atr,
+            open_trades_count=open_count,
+        )
+
         # Check if we can open new trade
         daily_limit = s.max_trades_daily
-        open_count = len(self.state.trade_manager.get_open_trades())
         coordinator_state = self.state.coordinator.state
 
         can_enter = (
@@ -441,6 +483,10 @@ class RobotEngine:
             and coordinator_state
             not in (CoordinatorState.IDLE, CoordinatorState.COOLDOWN, CoordinatorState.RESTRICTED)
             and self.state.session_manager.is_trading_time()
+            # DecisionEngine gates: HOLD and FORCE_PAUSE block new entries
+            and decision_ctx.action not in (
+                DecisionAction.HOLD, DecisionAction.FORCE_PAUSE
+            )
         )
 
         if can_enter:
@@ -450,11 +496,14 @@ class RobotEngine:
             spread_ok = self.state.risk_manager.check_spread(s.symbol, s.max_spread)
 
             if spread_ok:
-                await self._autopilot_generate_signal(df, wave_analysis, atr, current_price)
+                await self._autopilot_generate_signal(
+                    df, wave_analysis, atr, current_price, decision_ctx
+                )
 
-        # Broadcast live update (thêm autopilot + retracement info)
+        # Broadcast live update (thêm autopilot + retracement + decision info)
         ap_dec = self.state.auto_pilot.last_decision
         rm = self.state.retracement_engine.last_measure
+        de_ctx = self.state.decision_engine.last_context
         await self.state.broadcast({
             "event": "tick",
             "wave": wave_analysis.main_wave,
@@ -482,12 +531,26 @@ class RobotEngine:
                 "bounce": rm.bounce_detected if rm else False,
                 "nearest_fib": rm.nearest_fib if rm else "",
             },
+            "decision": {
+                "action": de_ctx.action.value if de_ctx else "SCAN_AND_ENTER",
+                "lot_scale": de_ctx.lot_scale if de_ctx else 1.0,
+                "effective_min_score": de_ctx.effective_min_score if de_ctx else 0.25,
+                "paused": de_ctx.adaptive_paused if de_ctx else False,
+                "consecutive_losses": de_ctx.consecutive_losses if de_ctx else 0,
+                "continuation_prob": (
+                    de_ctx.regime.continuation_prob if de_ctx else 0.0
+                ),
+                "volatility_regime": (
+                    de_ctx.regime.volatility_regime if de_ctx else "NORMAL"
+                ),
+            },
         })
 
     async def _autopilot_generate_signal(
-        self, df, wave_analysis, atr: float, current_price: float
+        self, df, wave_analysis, atr: float, current_price: float,
+        decision_ctx=None,
     ) -> None:
-        """AutoPilot: tự chọn entry mode tốt nhất, tự set priority."""
+        """AutoPilot + DecisionEngine: tự chọn entry mode, tự scale lot, tự quyết định."""
         s = self.state.settings
 
         # Range boundaries (ORB proxy)
@@ -505,7 +568,18 @@ class RobotEngine:
             self.state.balance, self.state.equity
         )
 
-        # ── AutoPilot: scan & score ──────────────────────────────────── #
+        # ── Tự scale: apply DecisionEngine lot multiplier ──────────────── #
+        if decision_ctx is not None:
+            lot_size = round(lot_size * decision_ctx.lot_scale, 2)
+        lot_size = max(s.min_lot, min(s.max_lot, lot_size))
+
+        # ── Extract adaptive params from DecisionContext ───────────────── #
+        mwm  = decision_ctx.mode_weight_multipliers if decision_ctx else None
+        min_score_override = (
+            decision_ctx.effective_min_score if decision_ctx else None
+        )
+
+        # ── AutoPilot: scan & score (with adaptive weights) ────────────── #
         best, decision = self.state.auto_pilot.select_best_entry(
             df=df,
             wave_analysis=wave_analysis,
@@ -517,6 +591,8 @@ class RobotEngine:
             swing_low=swing_low,
             range_high=range_high,
             range_low=range_low,
+            mode_weight_multipliers=mwm,
+            override_min_score=min_score_override,
         )
 
         if best is None:
@@ -524,12 +600,32 @@ class RobotEngine:
             return
 
         entry_signal = best.entry_signal
+
+        # ── Tự mô phỏng: Monte Carlo EV check trước khi submit ─────────── #
+        sim = self.state.decision_engine.simulate_candidate(
+            entry_price=entry_signal.entry_price,
+            sl=entry_signal.sl,
+            tp=entry_signal.tp,
+            atr=atr,
+            direction=entry_signal.direction,
+        )
+        if sim.expected_value < 0:
+            logger.info(
+                "AutoPilot [SIM REJECT] EV=%.5f win_prob=%.1f%% — skip",
+                sim.expected_value, sim.win_probability * 100,
+            )
+            return
+
         priority = self.state.auto_pilot.score_to_priority(best.score)
 
         logger.info(
-            "AutoPilot → mode=%-20s dir=%s score=%.3f rr=%.2f priority=%d",
+            "AutoPilot → mode=%-20s dir=%s score=%.3f rr=%.2f priority=%d "
+            "lot=%.2f scale=%.2f EV=%.5f",
             best.entry_mode, best.direction, best.score,
             entry_signal.risk_reward, priority,
+            lot_size,
+            decision_ctx.lot_scale if decision_ctx else 1.0,
+            sim.expected_value,
         )
 
         coord_signal = CoordSignal(
@@ -830,6 +926,96 @@ async def get_retracement_status():
         sr_levels=sr_schemas,
         description=rm.description,
     )
+
+
+# ── Decision Engine endpoints ──────────────────────────────────────────── #
+
+@app.get("/api/decision/status", response_model=DecisionEngineStatusSchema)
+async def get_decision_status():
+    """
+    Trạng thái đầy đủ của Decision Engine — não bộ vận hành.
+
+    Operator giám sát:
+      - action hiện tại (SCAN | HOLD | REDUCE | FORCE_PAUSE | SCALE_UP)
+      - lot_scale đang áp dụng
+      - circuit breaker state
+      - performance thống kê toàn cục + per segment
+      - adaptive weight adjustments đã học được
+      - 10 kết quả trade gần nhất được học
+    """
+    de  = app_state.decision_engine
+    ctx = de.last_context
+    gs  = de.tracker.get_global_stats()
+
+    regime = None
+    if ctx:
+        regime = MarketRegimeSchema(
+            continuation_prob=ctx.regime.continuation_prob,
+            volatility_regime=ctx.regime.volatility_regime,
+            momentum_score=ctx.regime.momentum_score,
+            atr_percentile=ctx.regime.atr_percentile,
+        )
+
+    segment_stats = {
+        key: SegmentStatsSchema(
+            win_rate=st.win_rate,
+            profit_factor=st.profit_factor,
+            avg_rr=st.avg_rr,
+            expectancy=st.expectancy,
+            sample_size=st.sample_size,
+        )
+        for key, st in de.tracker.get_all_segment_stats().items()
+    }
+
+    recent = [
+        {
+            "mode":         o.mode,
+            "wave_state":   o.wave_state,
+            "direction":    o.direction,
+            "retrace_zone": o.retrace_zone,
+            "pnl":          round(o.pnl, 2),
+            "rr_achieved":  round(o.rr_achieved, 3),
+        }
+        for o in de.tracker.get_recent_outcomes(10)
+    ]
+
+    adaptive = de.adaptive_summary
+
+    return DecisionEngineStatusSchema(
+        last_action=ctx.action.value if ctx else "SCAN_AND_ENTER",
+        lot_scale=de.controller.get_lot_scale(),
+        effective_min_score=de.controller.get_effective_min_score(),
+        adaptive_paused=adaptive["is_paused"],
+        pause_reason=adaptive["pause_reason"],
+        consecutive_losses=adaptive["consecutive_losses"],
+        adaptation_count=adaptive["adaptation_count"],
+        regime=regime,
+        global_stats=SegmentStatsSchema(
+            win_rate=gs.win_rate,
+            profit_factor=gs.profit_factor,
+            avg_rr=gs.avg_rr,
+            expectancy=gs.expectancy,
+            sample_size=gs.sample_size,
+        ),
+        segment_stats=segment_stats,
+        mode_weight_adjs=adaptive["mode_weight_adjs"],
+        recent_outcomes=recent,
+    )
+
+
+@app.post("/api/decision/reset-pause")
+async def reset_decision_pause():
+    """
+    Tự sửa lỗi: reset circuit breaker thủ công.
+    Khi AdaptiveController tự PAUSE sau nhiều lần thua liên tiếp,
+    operator có thể reset sau khi đã kiểm tra tình trạng thị trường.
+    """
+    app_state.decision_engine.reset_adaptive_pause()
+    return {
+        "status": "ok",
+        "lot_scale": app_state.decision_engine.controller.get_lot_scale(),
+        "is_paused": app_state.decision_engine.controller.is_paused,
+    }
 
 
 @app.get("/api/candles", response_model=List[CandleSchema])

@@ -75,6 +75,9 @@ _RECENCY_DECAY_FACTOR = 0.5
 
 # Minimum body size relative to ATR for a candle to qualify as a bounce signal.
 _MIN_BOUNCE_BODY_ATR_RATIO = 0.25
+
+
+class RetracementZone(str, Enum):
     NOT_RETRACING    = "NOT_RETRACING"    # pct < 23.6%
     SHALLOW          = "SHALLOW"          # 23.6% ≤ pct < 38.2%
     GOLDEN_ZONE      = "GOLDEN_ZONE"      # 38.2% ≤ pct ≤ 61.8%

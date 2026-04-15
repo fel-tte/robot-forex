@@ -178,9 +178,19 @@ class AutoPilot:
         range_high: float = 0.0,
         range_low: float = 0.0,
         pip_size: float = 0.0001,
+        mode_weight_multipliers: Optional[Dict[str, float]] = None,
+        override_min_score: Optional[float] = None,
     ) -> Tuple[Optional[ScoredCandidate], AutoPilotDecision]:
         """
         Scan tất cả EntryModes + Retracement path, chọn setup tốt nhất.
+
+        Parameters
+        ----------
+        mode_weight_multipliers : dict keyed by "mode/wave_state" → multiplier float
+            Provided by DecisionEngine (adaptive learning). Applied on top of
+            base _MODE_WAVE_WEIGHT. Defaults to no adjustment (all 1.0).
+        override_min_score : float, optional
+            Overrides self.min_score when provided by DecisionEngine.
 
         Retracement Path (ưu tiên cao):
           Khi RetracementEngine phát hiện sóng hồi đủ chất lượng tại
@@ -194,6 +204,11 @@ class AutoPilot:
         if len(df) < 3:
             dec = self._make_decision(0, 0, None, None, 0.0, "NO_SETUP")
             return None, dec
+
+        effective_min_score = (
+            override_min_score if override_min_score is not None else self.min_score
+        )
+        mwm = mode_weight_multipliers or {}
 
         candle      = df.iloc[-1]
         prev_candle = df.iloc[-2]
@@ -268,7 +283,7 @@ class AutoPilot:
             )
 
             score, rr_s, mw, db = self._score(
-                sig, wave_conf, mode.value, main_wave, wave_analysis
+                sig, wave_conf, mode.value, main_wave, wave_analysis, mwm
             )
 
             # Boost normal score nếu đang trong retracement (retracement context)
@@ -282,7 +297,7 @@ class AutoPilot:
                 retrace_boost = retrace_measure.quality * 0.15
                 score = round(min(score + retrace_boost, 1.0), 4)
 
-            if score < self.min_score:
+            if score < effective_min_score:
                 continue
 
             candidates.append(ScoredCandidate(
@@ -475,16 +490,26 @@ class AutoPilot:
         mode_name: str,
         main_wave: str,
         wa: WaveAnalysis,
+        mode_weight_multipliers: Optional[Dict[str, float]] = None,
     ) -> Tuple[float, float, float, float]:
         """
         Trả về (total_score, rr_score, mode_weight, direction_bonus).
+
+        mode_weight_multipliers: từ DecisionEngine.adaptive — hệ số tự học
+          applied as: effective_mw = base_mw × multiplier
         """
         # R:R score
         rr_s = min(sig.risk_reward / _PERFECT_RR, 1.0) if sig.risk_reward > 0 else 0.0
 
-        # Mode suitability
+        # Mode suitability (base)
         mode_dict = _MODE_WAVE_WEIGHT.get(mode_name, {})
         mw = mode_dict.get(main_wave, 0.7)
+
+        # Apply adaptive multiplier from DecisionEngine (tự học)
+        if mode_weight_multipliers:
+            seg_key  = f"{mode_name}/{main_wave}"
+            mw = round(mw * mode_weight_multipliers.get(seg_key, 1.0), 4)
+            mw = min(max(mw, 0.1), 1.5)   # clamp
 
         # Direction bonus: LTF EMA cũng cùng hướng?
         db = 0.0

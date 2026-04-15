@@ -8,6 +8,9 @@ from .data_provider import MockDataProvider
 from .ctrader_provider import CTraderDataProvider, BrokerStatus
 from .auto_pilot import AutoPilot, AutoPilotDecision, ScoredCandidate
 from .retracement_engine import RetracementEngine, RetracementMeasure, SupportResistanceLevel, RetracementZone
+from .performance_tracker import PerformanceTracker, TradeOutcome, SegmentStats
+from .adaptive_controller import AdaptiveController, AdaptiveState
+from .decision_engine import DecisionEngine, DecisionContext, DecisionAction, MarketRegime, SimulatedOutcome
 
 __all__ = [
     "WaveDetector", "WaveState",
@@ -20,4 +23,7 @@ __all__ = [
     "CTraderDataProvider", "BrokerStatus",
     "AutoPilot", "AutoPilotDecision", "ScoredCandidate",
     "RetracementEngine", "RetracementMeasure", "SupportResistanceLevel", "RetracementZone",
+    "PerformanceTracker", "TradeOutcome", "SegmentStats",
+    "AdaptiveController", "AdaptiveState",
+    "DecisionEngine", "DecisionContext", "DecisionAction", "MarketRegime", "SimulatedOutcome",
 ]
