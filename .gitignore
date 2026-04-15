@@ -1,0 +1,15 @@
+# Credentials — KHÔNG BAO GIỜ commit file này
+robot_forex_stack/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Data files
+robot_forex_stack/backend/data/
+
+# Editor
+.vscode/
+.idea/

@@ -6,3 +6,7 @@ pandas==2.2.3
 numpy==1.26.4
 python-multipart==0.0.22
 websockets==14.1
+# cTrader Open API (Spotware official Python library)
+ctrader-open-api==0.9.2
+twisted>=22.10.0
+requests>=2.32.3

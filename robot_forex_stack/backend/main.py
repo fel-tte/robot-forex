@@ -36,12 +36,14 @@ from engine import (
     TradeManager,
     SessionManager, TradingSession,
     MockDataProvider,
+    CTraderDataProvider, BrokerStatus,
 )
 from engine.signal_coordinator import TradeSignal as CoordSignal
 from engine.risk_manager import RiskConfig, MartingaleConfig
 from engine.trade_manager import PartialCloseConfig, TrailingConfig, GridConfig
 from engine.session_manager import DSTMode
 from models.schemas import (
+    BrokerStatusSchema,
     CandleSchema,
     PaginatedTrades,
     QueueStatusSchema,
@@ -52,11 +54,39 @@ from models.schemas import (
     WaveAnalysisSchema,
 )
 
+import os
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _create_data_provider(symbol: str = "EURUSD", timeframe: str = "M5"):
+    """
+    Factory: trả về CTraderDataProvider nếu có đủ env vars,
+    ngược lại fallback về MockDataProvider.
+    """
+    has_credentials = bool(
+        os.environ.get("CTRADER_CLIENT_ID")
+        and os.environ.get("CTRADER_CLIENT_SECRET")
+        and os.environ.get("CTRADER_ACCESS_TOKEN")
+    )
+    if has_credentials:
+        try:
+            provider = CTraderDataProvider(symbol=symbol, timeframe=timeframe)
+            logger.info("DataProvider: sử dụng CTraderDataProvider (live=%s)", provider.is_live)
+            return provider
+        except Exception as exc:
+            logger.warning(
+                "Không thể khởi động CTraderDataProvider (%s) — fallback sang Mock.", exc
+            )
+    logger.warning(
+        "DataProvider: CTRADER_CLIENT_ID/SECRET/ACCESS_TOKEN chưa được cấu hình → "
+        "sử dụng MockDataProvider (chỉ dùng để test)."
+    )
+    return MockDataProvider(symbol=symbol)
 
 # ── Shared application state ───────────────────────────────────────────── #
 
@@ -68,7 +98,9 @@ class AppState:
         self.balance: float = 10_000.0
         self.equity: float = 10_000.0
 
-        self.data_provider: MockDataProvider = MockDataProvider()
+        self.data_provider = _create_data_provider(
+            symbol=self.settings.symbol, timeframe=self.settings.timeframe
+        )
         self.wave_detector: WaveDetector = WaveDetector()
         self.coordinator: SignalCoordinator = SignalCoordinator()
         self.risk_manager: RiskManager = RiskManager()
@@ -81,7 +113,13 @@ class AppState:
 
     def rebuild_components(self) -> None:
         s = self.settings
-        self.data_provider = MockDataProvider(symbol=s.symbol)
+        # Chỉ tạo lại data_provider nếu symbol/timeframe thay đổi
+        cur_sym = getattr(self.data_provider, "symbol", "")
+        cur_tf  = getattr(self.data_provider, "timeframe", "")
+        if cur_sym != s.symbol or cur_tf != s.timeframe:
+            self.data_provider = _create_data_provider(
+                symbol=s.symbol, timeframe=s.timeframe
+            )
         self.wave_detector = WaveDetector(
             htf_ema_fast=s.htf_ema_fast,
             htf_ema_slow=s.htf_ema_slow,
@@ -689,6 +727,47 @@ async def ws_live(websocket: WebSocket):
         pass
     finally:
         app_state._ws_clients.discard(websocket)
+
+
+# ── Broker status ──────────────────────────────────────────────────────── #
+
+@app.get("/api/broker/status", response_model=BrokerStatusSchema)
+async def get_broker_status():
+    """Trả về trạng thái kết nối tới cTrader (hoặc Mock nếu chưa cấu hình)."""
+    dp = app_state.data_provider
+    if isinstance(dp, CTraderDataProvider):
+        st = dp.status
+        return BrokerStatusSchema(
+            provider_type=st.provider_type,
+            connected=st.connected,
+            app_authenticated=st.app_authenticated,
+            account_authenticated=st.account_authenticated,
+            history_loaded=st.history_loaded,
+            symbol=st.symbol,
+            symbol_id=st.symbol_id,
+            timeframe=st.timeframe,
+            live=st.live,
+            last_error=st.last_error,
+            last_tick_ts=st.last_tick_ts,
+            bars_loaded=st.bars_loaded,
+            account_id=st.account_id,
+        )
+    # MockDataProvider
+    return BrokerStatusSchema(
+        provider_type="MOCK",
+        connected=True,
+        app_authenticated=False,
+        account_authenticated=False,
+        history_loaded=True,
+        symbol=getattr(dp, "symbol", ""),
+        symbol_id=0,
+        timeframe=getattr(dp, "timeframe", ""),
+        live=False,
+        last_error="Chưa cấu hình CTRADER_CLIENT_ID/SECRET/ACCESS_TOKEN — đang dùng dữ liệu giả lập.",
+        last_tick_ts=0.0,
+        bars_loaded=len(dp.get_candles(limit=500)),
+        account_id=0,
+    )
 
 
 # ── Health check ───────────────────────────────────────────────────────── #

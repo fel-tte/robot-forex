@@ -225,6 +225,22 @@ class CandleSchema(BaseModel):
     datetime: str = ""
 
 
+class BrokerStatusSchema(BaseModel):
+    provider_type: str                    # MOCK | CTRADER
+    connected: bool
+    app_authenticated: bool
+    account_authenticated: bool
+    history_loaded: bool
+    symbol: str
+    symbol_id: int
+    timeframe: str
+    live: bool
+    last_error: str
+    last_tick_ts: float
+    bars_loaded: int
+    account_id: int
+
+
 class PaginatedTrades(BaseModel):
     trades: List[TradeRecordSchema]
     total: int

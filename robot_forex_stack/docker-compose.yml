@@ -10,10 +10,21 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/data:/app/data
+    env_file:
+      - .env
     environment:
       - DB_PATH=/app/data/robot_forex.db
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
+      # ── cTrader Live credentials (điền vào .env) ──────────────────────────
+      # CTRADER_CLIENT_ID      – App client ID từ connect.spotware.com
+      # CTRADER_CLIENT_SECRET  – App client secret
+      # CTRADER_ACCESS_TOKEN   – OAuth2 access token của tài khoản giao dịch
+      # CTRADER_REFRESH_TOKEN  – OAuth2 refresh token (tự gia hạn)
+      # CTRADER_ACCOUNT_ID     – ID tài khoản cTrader (vd: 17093718)
+      # CTRADER_SYMBOL         – Symbol (vd: EURUSD)
+      # CTRADER_TIMEFRAME      – Timeframe (vd: M5)
+      # CTRADER_LIVE           – true = live, false = demo
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
