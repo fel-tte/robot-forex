@@ -188,3 +188,29 @@ PIPELINE_MIN_AUTHORITY_GATES  = 2     # Cần ít nhất 2/3 cổng thông qua
 
 # Kích thước cửa sổ đo lường (giây)
 PIPELINE_METRICS_WINDOW_SECONDS = 3600   # Tính metrics trên 1 giờ gần nhất
+
+# ============================================================
+# MEMORY BRAIN — Redis là bộ não trung tâm ghi nhớ Win/Loss
+# ============================================================
+
+# Số lệnh tối thiểu trên một mẫu (fingerprint) để xét luật cứng
+MEMORY_MIN_SAMPLES_FOR_RULE  = 5
+
+# Tỉ lệ thua tối thiểu để đưa fingerprint vào danh sách chặn cứng
+# Fingerprint có loss_rate >= ngưỡng này → luật cứng: BLOCK
+MEMORY_HARD_BLOCK_LOSS_RATE  = 0.70      # >= 70% thua → chặn cứng
+
+# Tỉ lệ thắng tốt để tăng ưu tiên (priority boost) cho fingerprint
+MEMORY_STRONG_WIN_RATE       = 0.65      # >= 65% thắng → bonus ưu tiên
+
+# Số fingerprint tối đa lưu trong Redis (FIFO — cũ nhất bị xóa)
+MEMORY_MAX_PATTERNS          = 500
+
+# Redis key prefix cho từng pattern
+REDIS_MEMORY_PREFIX          = "Deriv_Mem:"          # + fingerprint
+
+# Redis key lưu danh sách luật cứng (JSON list)
+REDIS_MEMORY_RULES_KEY       = "Deriv_Mem_Rules"
+
+# Redis key lưu tổng hợp thống kê memory (JSON)
+REDIS_MEMORY_STATS_KEY       = "Deriv_Mem_Stats"

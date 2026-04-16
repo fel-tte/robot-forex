@@ -32,11 +32,14 @@ import time
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
 
 import redis
 
 import config
+
+if TYPE_CHECKING:
+    from memory import MemoryBrain, TradeFeatures
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -46,17 +49,18 @@ import config
 @dataclass(order=True)
 class QueuedTrade:
     """Một tín hiệu đang chờ trong hàng đợi."""
-    priority:      float    = field(compare=True)   # Điểm ưu tiên (cao hơn = trước)
-    enqueued_at:   float    = field(compare=False)   # Thời điểm vào hàng (Unix timestamp)
-    symbol:        str      = field(compare=False)
-    direction:     str      = field(compare=False)
-    score:         float    = field(compare=False)
-    win_prob:      float    = field(compare=False)
-    confidence:    float    = field(compare=False)
-    stake:         float    = field(compare=False)
-    wave_active:   bool     = field(compare=False)
-    fib_zone:      str      = field(compare=False)
-    signal_ref:    object   = field(compare=False, repr=False)   # MarketSignal gốc
+    priority:        float    = field(compare=True)   # Điểm ưu tiên (cao hơn = trước)
+    enqueued_at:     float    = field(compare=False)   # Thời điểm vào hàng (Unix timestamp)
+    symbol:          str      = field(compare=False)
+    direction:       str      = field(compare=False)
+    score:           float    = field(compare=False)
+    win_prob:        float    = field(compare=False)
+    confidence:      float    = field(compare=False)
+    stake:           float    = field(compare=False)
+    wave_active:     bool     = field(compare=False)
+    fib_zone:        str      = field(compare=False)
+    signal_ref:      object   = field(compare=False, repr=False)   # MarketSignal gốc
+    trade_features:  object   = field(compare=False, repr=False, default=None)  # TradeFeatures
 
 
 @dataclass
@@ -156,20 +160,23 @@ class PermissionGate:
     """
     Kiểm tra quyền hạn trước khi thực thi lệnh.
 
-    3 cổng độc lập:
+    4 cổng độc lập:
       Gate 1 — Điểm tín hiệu (score) đủ ngưỡng tối thiểu
       Gate 2 — Predictor xác nhận (win_prob + confidence)
       Gate 3 — Risk manager cho phép (không paused, không vượt lỗ ngày)
+      Gate 4 — Memory Brain: luật cứng Redis (HARD VETO — chặn tuyệt đối nếu kích hoạt)
 
-    Cần PIPELINE_MIN_AUTHORITY_GATES cổng mở để lệnh được thực thi.
+    Gate 4 là HARD VETO: nếu kích hoạt → lệnh bị từ chối bất kể các cổng khác.
+    Gates 1-3: cần PIPELINE_MIN_AUTHORITY_GATES cổng mở.
     """
 
     def check(
         self,
-        trade: QueuedTrade,
-        balance: float,
+        trade:          QueuedTrade,
+        balance:        float,
         risk_can_trade: bool,
-        min_gates: int = config.PIPELINE_MIN_AUTHORITY_GATES,
+        min_gates:      int = config.PIPELINE_MIN_AUTHORITY_GATES,
+        memory_brain:   Optional["MemoryBrain"] = None,
     ) -> tuple[bool, list[str], list[str]]:
         """
         Kiểm tra tất cả cổng quyền hạn.
@@ -180,6 +187,15 @@ class PermissionGate:
         """
         passed  : list[str] = []
         blocked : list[str] = []
+
+        # Gate 4 (HARD VETO): Memory Brain — kiểm tra trước, veto ngay nếu cần
+        if memory_brain is not None and trade.trade_features is not None:
+            verdict = memory_brain.consult(trade.trade_features)
+            if verdict.hard_block:
+                # Hard veto — không cần kiểm tra các cổng khác
+                return False, [], [f"memory_hard_block({verdict.reason[:60]})"]
+            else:
+                passed.append(f"memory(WR={verdict.win_rate*100:.0f}%)")
 
         # Gate 1: Signal score
         learner_min = getattr(config, "_effective_min_score", config.MIN_SIGNAL_SCORE)
@@ -432,9 +448,10 @@ class Orchestrator:
 
     def dispatch(
         self,
-        balance       : float,
-        risk_can_trade: bool,
-        executor_fn   : Callable[[QueuedTrade], Optional[dict]],
+        balance        : float,
+        risk_can_trade : bool,
+        executor_fn    : Callable[[QueuedTrade], Optional[dict]],
+        memory_brain   : Optional["MemoryBrain"] = None,
     ) -> Optional[TradeOutcome]:
         """
         Lấy lệnh đầu hàng đợi, kiểm tra cổng, thực thi.
@@ -444,6 +461,7 @@ class Orchestrator:
         balance        : số dư tài khoản
         risk_can_trade : kết quả risk.can_trade()
         executor_fn    : hàm thực thi lệnh (nhận QueuedTrade, trả về dict kết quả)
+        memory_brain   : MemoryBrain để kiểm tra Gate 4 (hard veto)
 
         Returns TradeOutcome nếu thực thi, None nếu bị chặn hoặc hàng rỗng.
         """
@@ -457,9 +475,11 @@ class Orchestrator:
             self._metrics.record_rejection(f"rate:{load_reason[:30]}")
             return None
 
-        # ── Kiểm tra quyền hạn ───────────────────────────────────
+        # ── Kiểm tra quyền hạn (bao gồm Gate 4 — memory hard veto) ──
         trade            = self._queue.pop()
-        approved, passed, blocked = self._gate.check(trade, balance, risk_can_trade)
+        approved, passed, blocked = self._gate.check(
+            trade, balance, risk_can_trade, memory_brain=memory_brain
+        )
 
         for g in passed:
             self._metrics.record_gate_result(g, passed=True)

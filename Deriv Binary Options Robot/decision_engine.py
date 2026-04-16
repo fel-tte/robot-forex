@@ -41,6 +41,7 @@ from logger       import TradeLogger, TradeRecord
 from learner      import Learner
 from predictor    import predict, Prediction
 from simulator    import simulate
+from memory       import MemoryBrain, TradeFeatures
 from pipeline     import (
     TradeQueue, PermissionGate, LoadLimiter,
     PipelineMetrics, Orchestrator, QueuedTrade, TradeOutcome,
@@ -87,6 +88,9 @@ class DecisionEngine:
         self.risk    = RiskManager()
         self.logger  = TradeLogger()
         self.learner = Learner()
+
+        # Redis Memory Brain — bộ não trung tâm ghi nhớ Win/Loss
+        self.memory = MemoryBrain()
 
         # Pipeline components
         self._pipeline = Orchestrator(
@@ -243,13 +247,15 @@ class DecisionEngine:
 
     def run_live_cycle(self, balance: float) -> None:
         """
-        Chạy một chu kỳ giao dịch thật — sử dụng pipeline.
+        Chạy một chu kỳ giao dịch thật — sử dụng pipeline + Memory Brain.
 
         Chu kỳ chia thành 2 bước:
-          A) SCAN + SUBMIT: quét thị trường, đưa tín hiệu tốt nhất vào hàng đợi
+          A) SCAN + MEMORY CONSULT + SUBMIT: quét thị trường, tham vấn bộ nhớ,
+             đưa tín hiệu đủ điều kiện vào hàng đợi
           B) DISPATCH: lấy từ hàng đợi, kiểm tra cổng quyền hạn + tải, thực thi
 
-        Không còn "đặt lệnh ngay lập tức" — tín hiệu qua hàng đợi và cổng kiểm soát.
+        Memory Brain là luật cứng: tham vấn BẮT BUỘC trước khi vào hàng đợi và
+        một lần nữa qua Gate 4 trong dispatch.
         """
         ts = datetime.now()
         print(f"\n  [Pipeline] Scanning {len(self._active_symbols)} markets...")
@@ -269,49 +275,67 @@ class DecisionEngine:
             except Exception:
                 df = None
 
-            # ② tự quyết định — tính win_prob + confidence
-            should_enter, pred = self.decide_entry(best, df, balance)
+            # Tạo TradeFeatures cho Memory Brain
+            trade_features = MemoryBrain.features_from_signal(best)
 
-            # Tính stake
-            if pred and pred.stake_suggestion > 0:
-                stake = pred.stake_suggestion
-            else:
-                params = self.learner.get_params()
-                stake  = round(
-                    self.risk.compute_stake(best.score, balance) * params.stake_multiplier,
-                    2,
-                )
-                stake = max(config.STAKE_MIN_USD, min(config.STAKE_MAX_USD, stake))
-
-            win_prob    = pred.win_prob    if pred else 0.50
-            confidence  = pred.confidence  if pred else 0.30
-            wave_active = bool(best.wave and best.wave.correction_active)
-            fib_zone    = best.wave.fib_zone if best.wave else "NONE"
-
-            priority = best.score * win_prob * confidence
-
-            queued = QueuedTrade(
-                priority    = priority,
-                enqueued_at = time.time(),
-                symbol      = best.symbol,
-                direction   = best.direction,
-                score       = best.score,
-                win_prob    = win_prob,
-                confidence  = confidence,
-                stake       = stake,
-                wave_active = wave_active,
-                fib_zone    = fib_zone,
-                signal_ref  = best,
+            # ── Tham vấn Memory Brain trước khi xếp hàng (PRE-QUEUE) ──
+            verdict = self.memory.consult(trade_features)
+            print(
+                f"  [Memory] 🧠 {verdict.reason}"
             )
 
-            submitted = self._pipeline.submit(queued)
-            if submitted:
+            if verdict.hard_block:
+                # Luật cứng kích hoạt — không đưa vào hàng đợi
                 print(
-                    f"  [Queue] ✅ Thêm vào hàng đợi: {best.symbol} {best.direction}  "
-                    f"score={best.score:.0f}  wp={win_prob:.2f}  "
-                    f"priority={priority:.1f}"
+                    f"  [Memory] ❌ LUẬT CỨNG — Không xếp hàng "
+                    f"{best.symbol} {best.direction}"
                 )
-            # else: queue đầy, đã in bên trong submit
+            else:
+                # ② tự quyết định — tính win_prob + confidence
+                should_enter, pred = self.decide_entry(best, df, balance)
+
+                # Tính stake
+                if pred and pred.stake_suggestion > 0:
+                    stake = pred.stake_suggestion
+                else:
+                    params = self.learner.get_params()
+                    stake  = round(
+                        self.risk.compute_stake(best.score, balance) * params.stake_multiplier,
+                        2,
+                    )
+                    stake = max(config.STAKE_MIN_USD, min(config.STAKE_MAX_USD, stake))
+
+                win_prob    = pred.win_prob    if pred else 0.50
+                confidence  = pred.confidence  if pred else 0.30
+                wave_active = bool(best.wave and best.wave.correction_active)
+                fib_zone    = best.wave.fib_zone if best.wave else "NONE"
+
+                # Áp dụng memory priority_boost vào priority score
+                priority = best.score * win_prob * confidence + verdict.priority_boost
+
+                queued = QueuedTrade(
+                    priority       = priority,
+                    enqueued_at    = time.time(),
+                    symbol         = best.symbol,
+                    direction      = best.direction,
+                    score          = best.score,
+                    win_prob       = win_prob,
+                    confidence     = confidence,
+                    stake          = stake,
+                    wave_active    = wave_active,
+                    fib_zone       = fib_zone,
+                    signal_ref     = best,
+                    trade_features = trade_features,
+                )
+
+                submitted = self._pipeline.submit(queued)
+                if submitted:
+                    boost_str = f"  mem_boost={verdict.priority_boost:+.1f}" if verdict.priority_boost != 0 else ""
+                    print(
+                        f"  [Queue] ✅ Thêm vào hàng đợi: {best.symbol} {best.direction}  "
+                        f"score={best.score:.0f}  wp={win_prob:.2f}  "
+                        f"priority={priority:.1f}{boost_str}"
+                    )
         else:
             print("  ⏳ Không có tín hiệu đủ điều kiện.")
 
@@ -325,6 +349,7 @@ class DecisionEngine:
             balance        = balance,
             risk_can_trade = allowed,
             executor_fn    = self._execute_trade,
+            memory_brain   = self.memory,      # Gate 4 — memory hard veto
         )
 
         if outcome is None:
@@ -383,6 +408,15 @@ class DecisionEngine:
         won    = result["won"]
         pnl    = result["pnl"]
         payout = result.get("payout", 0)
+
+        # ── Ghi nhận kết quả vào Memory Brain (BẮT BUỘC) ─────────
+        features = trade.trade_features
+        if features is None:
+            signal   = trade.signal_ref
+            features = MemoryBrain.features_from_signal(signal) if signal else None
+
+        if features is not None:
+            self.memory.record_outcome(features, won=won, pnl=pnl)
 
         signal = trade.signal_ref
         record = TradeRecord(
@@ -524,9 +558,10 @@ class DecisionEngine:
         params    = self.learner.get_params()
         mode_icon = {"LIVE": "🟢", "PAPER": "📄", "PAUSED": "⏸️", "LEARNING": "🧠"}.get(mode.value, "⚪")
         metrics   = self._pipeline._metrics.snapshot()
+        mem_rules = len(self.memory._hard_rules)
 
         print(f"\n{'='*65}")
-        print(f"  👁️  DECISION ENGINE + PIPELINE  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  👁️  DECISION ENGINE + PIPELINE + MEMORY  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*65}")
         print(f"  Mode     : {mode_icon} {mode.value}  |  Balance: {balance:.2f} USD")
         print(
@@ -552,6 +587,12 @@ class DecisionEngine:
             f"rejected={metrics['total_rejected']} ({metrics['rejection_rate_pct']:.0f}%)  "
             f"throughput={metrics['throughput_per_h']:.1f}/h"
         )
+        # Memory Brain summary
+        print(
+            f"  Memory🧠 : hard_rules={mem_rules}  "
+            f"(block_threshold≥{config.MEMORY_HARD_BLOCK_LOSS_RATE*100:.0f}% loss  "
+            f"min_samples={config.MEMORY_MIN_SAMPLES_FOR_RULE})"
+        )
 
     # ── Master run loop ───────────────────────────────────────────
 
@@ -561,10 +602,11 @@ class DecisionEngine:
         Bạn chỉ cần giám sát.
         """
         print("\n" + "=" * 65)
-        print("  🚀 DECISION ENGINE + PIPELINE — ONLINE")
+        print("  🚀 DECISION ENGINE + PIPELINE + MEMORY BRAIN — ONLINE")
         print("  Hệ thống vận hành như tổ chức thật:")
         print("  có hàng đợi  |  có quyền hạn  |  có giới hạn tải")
         print("  có control   |  có đo lường   |  có điều phối")
+        print("  có bộ nhớ Redis — luật cứng win/loss")
         print("=" * 65)
         print(f"  Pool ban đầu    : {', '.join(self._active_symbols)}")
         print(f"  Mode ban đầu    : {self._mode.value}")
@@ -580,6 +622,11 @@ class DecisionEngine:
             f"|  gap tối thiểu: {config.PIPELINE_MIN_TRADE_GAP_SECONDS}s"
         )
         print(f"  Authority gates : cần {config.PIPELINE_MIN_AUTHORITY_GATES}/3 cổng")
+        print(
+            f"  Memory Brain    : block≥{config.MEMORY_HARD_BLOCK_LOSS_RATE*100:.0f}% loss  "
+            f"min_n={config.MEMORY_MIN_SAMPLES_FOR_RULE}  "
+            f"rules={len(self.memory._hard_rules)}"
+        )
         print("=" * 65)
 
         # Chạy simulation ban đầu trước khi vào vòng lặp
@@ -635,15 +682,17 @@ class DecisionEngine:
                 print(f"\n  {self.risk.summary()}")
                 self.logger.print_stats()
 
-                # In pipeline metrics report mỗi 10 chu kỳ
+                # In pipeline + memory report mỗi 10 chu kỳ
                 if self._cycle_count % 10 == 0:
                     self._pipeline._metrics.print_report()
+                    self.memory.report()
 
             except KeyboardInterrupt:
                 print(f"\n  [{datetime.now()}] Operator ngắt hệ thống.")
                 print(f"  {self.risk.summary()}")
                 self.logger.print_stats()
                 self._pipeline._metrics.print_report()
+                self.memory.report()
                 break
 
             except Exception as exc:
