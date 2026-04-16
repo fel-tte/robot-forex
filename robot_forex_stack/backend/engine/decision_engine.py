@@ -57,7 +57,9 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .performance_tracker import PerformanceTracker, TradeOutcome
+from .performance_tracker import (
+    PerformanceTracker, TradeOutcome, TradeFingerprint, PreTradeConsultation,
+)
 from .adaptive_controller import AdaptiveController
 from .wave_detector import WaveAnalysis, WaveState
 from .retracement_engine import RetracementMeasure
@@ -193,12 +195,25 @@ class DecisionEngine:
         retrace_zone: str,
         pnl: float,
         initial_risk: float,
+        atr: float = 0.0,
+        price: float = 0.0,
+        timestamp: Optional[float] = None,
     ) -> None:
         """
         Tự học: record a completed trade.
+        Builds TradeFingerprint and attaches it to the outcome for pattern learning.
         Triggers AdaptiveController to adapt parameters.
         """
         rr_achieved = (pnl / initial_risk) if initial_risk > 1e-9 else 0.0
+        fingerprint = self._build_fingerprint(
+            mode=mode,
+            wave_state=wave_state,
+            direction=direction,
+            retrace_zone=retrace_zone,
+            atr=atr,
+            price=price,
+            ts=timestamp or time.time(),
+        )
         outcome = TradeOutcome(
             mode=mode,
             wave_state=wave_state,
@@ -207,6 +222,7 @@ class DecisionEngine:
             pnl=pnl,
             rr_achieved=rr_achieved,
             initial_risk=initial_risk,
+            fingerprint=fingerprint,
         )
         self.tracker.record(outcome)
         self.controller.adapt()
@@ -454,3 +470,95 @@ class DecisionEngine:
                     parts[0], parts[1]
                 )
         return result
+
+    # ── Pre-trade pipeline gate (tự dự đoán) ──────────────────────────── #
+
+    def consult_before_entry(
+        self,
+        mode: str,
+        wave_state: str,
+        direction: str,
+        retrace_zone: str,
+        atr: float = 0.0,
+        price: float = 0.0,
+        ts: Optional[float] = None,
+    ) -> PreTradeConsultation:
+        """
+        PIPELINE MANDATORY — call this before every new trade entry.
+
+        Builds a TradeFingerprint from the current trade context, then
+        queries the PerformanceTracker central brain.
+
+        Returns PreTradeConsultation.  Caller MUST respect should_trade.
+        """
+        fingerprint = self._build_fingerprint(
+            mode=mode,
+            wave_state=wave_state,
+            direction=direction,
+            retrace_zone=retrace_zone,
+            atr=atr,
+            price=price,
+            ts=ts or time.time(),
+        )
+        return self.tracker.consult(fingerprint)
+
+    @staticmethod
+    def _build_fingerprint(
+        mode: str,
+        wave_state: str,
+        direction: str,
+        retrace_zone: str,
+        atr: float,
+        price: float,
+        ts: float,
+    ) -> TradeFingerprint:
+        """
+        Derive an 8-component TradeFingerprint from available trade context.
+
+        session       — derived from UTC hour:
+                         ASIAN   00–07,  LONDON  07–12,
+                         NEW_YORK 12–20,  OFF_HOURS 20–23
+        volatility_regime — derived from normalised ATR (atr / price):
+                         LOW <0.1%,  NORMAL <0.3%,  HIGH <0.6%,  EXTREME ≥0.6%
+        hour_bucket   — UTC hour 0–23
+        day_of_week   — 0=Mon … 6=Sun
+        """
+        import datetime
+        dt = datetime.datetime.utcfromtimestamp(ts)
+        hour = dt.hour
+        dow  = dt.weekday()
+
+        # Trading session by UTC hour
+        if 0 <= hour < 7:
+            session = "ASIAN"
+        elif 7 <= hour < 12:
+            session = "LONDON"
+        elif 12 <= hour < 20:
+            session = "NEW_YORK"
+        else:
+            session = "OFF_HOURS"
+
+        # Volatility regime from normalised ATR
+        if price > 0 and atr > 0:
+            norm_atr = atr / price
+            if norm_atr >= 0.006:
+                vol = "EXTREME"
+            elif norm_atr >= 0.003:
+                vol = "HIGH"
+            elif norm_atr >= 0.001:
+                vol = "NORMAL"
+            else:
+                vol = "LOW"
+        else:
+            vol = "NORMAL"
+
+        return TradeFingerprint(
+            mode=mode,
+            wave_state=wave_state,
+            direction=direction,
+            retrace_zone=retrace_zone,
+            session=session,
+            volatility_regime=vol,
+            hour_bucket=hour,
+            day_of_week=dow,
+        )

@@ -64,6 +64,10 @@ from models.schemas import (
     RobotStatusSchema,
     TradeRecordSchema,
     WaveAnalysisSchema,
+    PerformanceDashboardSchema,
+    PreTradeConsultationSchema,
+    PatternSummarySchema,
+    TradeFingerprintSchema,
 )
 
 import os
@@ -249,6 +253,8 @@ class AppState:
             "wave_state":   wa.main_wave.value if wa else "SIDEWAYS",
             "retrace_zone": rm.zone.value if rm else "NOT_RETRACING",
             "initial_risk": initial_risk,
+            "atr":          float(signal.atr) if signal.atr else 0.0,
+            "entry_price":  signal.entry_price,
         }
         # Persist to DB
         db = SessionLocal()
@@ -459,6 +465,8 @@ class RobotEngine:
                         retrace_zone=ctx.get("retrace_zone", "NOT_RETRACING"),
                         pnl=ct.pnl,
                         initial_risk=ctx.get("initial_risk", 0.0),
+                        atr=ctx.get("atr", 0.0),
+                        price=ctx.get("entry_price", 0.0),
                     )
             finally:
                 db.close()
@@ -1016,6 +1024,100 @@ async def reset_decision_pause():
         "lot_scale": app_state.decision_engine.controller.get_lot_scale(),
         "is_paused": app_state.decision_engine.controller.is_paused,
     }
+
+
+@app.get("/api/performance/dashboard", response_model=PerformanceDashboardSchema)
+async def get_performance_dashboard():
+    """
+    Bộ não trung tâm — bảng điều khiển tổng hợp của PerformanceTracker.
+
+    Trả về:
+      - Thống kê tổng hợp toàn hệ thống (global win_rate, profit_factor, …)
+      - Số lượng pattern WIN và LOSS đã học được
+      - Top 5 pattern WIN (ưu tiên đặt lệnh)
+      - Top 5 pattern LOSS (tránh hoặc block)
+      - Thông tin consultation gần nhất (kết quả pipeline gate cuối)
+    """
+    tracker = app_state.decision_engine.tracker
+    dash    = tracker.summary_dashboard()
+
+    def _pattern_schema(p: dict, is_win: bool) -> PatternSummarySchema:
+        fp = p["fingerprint"]
+        return PatternSummarySchema(
+            fingerprint=TradeFingerprintSchema(
+                mode=fp["mode"],
+                wave_state=fp["wave_state"],
+                direction=fp["direction"],
+                retrace_zone=fp["retrace_zone"],
+                session=fp["session"],
+                volatility=fp["volatility"],
+                hour=fp["hour"],
+                dow=fp["dow"],
+            ),
+            win_rate=p.get("win_rate"),
+            loss_rate=p.get("loss_rate"),
+            total=p["total"],
+            avg_pnl=p["avg_pnl"],
+        )
+
+    return PerformanceDashboardSchema(
+        total_recorded=dash["total_recorded"],
+        pattern_count=dash["pattern_count"],
+        global_win_rate=dash["global_win_rate"],
+        global_profit_factor=dash["global_profit_factor"],
+        global_avg_rr=dash["global_avg_rr"],
+        global_expectancy=dash["global_expectancy"],
+        global_sample_size=dash["global_sample_size"],
+        consecutive_losses=dash["consecutive_losses"],
+        win_patterns_count=dash["win_patterns_count"],
+        loss_patterns_count=dash["loss_patterns_count"],
+        top_win_patterns=[_pattern_schema(p, True)  for p in dash["top_win_patterns"]],
+        top_loss_patterns=[_pattern_schema(p, False) for p in dash["top_loss_patterns"]],
+        last_consultation=dash.get("last_consultation"),
+    )
+
+
+@app.get("/api/performance/consult", response_model=PreTradeConsultationSchema)
+async def consult_trade(
+    mode:        str = Query(..., description="Entry mode: BREAKOUT | RETRACE | …"),
+    wave_state:  str = Query(..., description="BULL_MAIN | BEAR_MAIN | SIDEWAYS"),
+    direction:   str = Query(..., description="BUY | SELL"),
+    retrace_zone: str = Query("NOT_RETRACING", description="RetracementZone value"),
+    atr:         float = Query(0.0, description="Current ATR value"),
+    price:       float = Query(0.0, description="Current price"),
+):
+    """
+    Pipeline gate thủ công — kiểm tra trước khi đặt lệnh.
+
+    Gọi endpoint này để hỏi bộ não trung tâm:
+      - Có nên trade pattern này không? (should_trade)
+      - Xác suất WIN là bao nhiêu?
+      - Pattern này có bị BLOCK không? Lý do?
+      - Priority boost nếu là WIN pattern?
+
+    Đây là phiên bản API của PIPELINE MANDATORY consult().
+    """
+    consultation = app_state.decision_engine.consult_before_entry(
+        mode=mode,
+        wave_state=wave_state,
+        direction=direction,
+        retrace_zone=retrace_zone,
+        atr=atr,
+        price=price,
+    )
+    return PreTradeConsultationSchema(
+        should_trade=consultation.should_trade,
+        win_probability=consultation.win_probability,
+        loss_risk=consultation.loss_risk,
+        authority=consultation.authority,
+        block_reason=consultation.block_reason,
+        pattern_known=consultation.pattern_known,
+        pattern_win_rate=consultation.pattern_win_rate,
+        global_win_rate=consultation.global_win_rate,
+        priority_boost=consultation.priority_boost,
+        consultation_id=consultation.consultation_id,
+        timestamp=consultation.timestamp,
+    )
 
 
 @app.get("/api/candles", response_model=List[CandleSchema])

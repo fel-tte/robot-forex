@@ -357,3 +357,58 @@ class DecisionEngineStatusSchema(BaseModel):
     segment_stats:        Dict[str, SegmentStatsSchema] = {}
     mode_weight_adjs:     Dict[str, float] = {}
     recent_outcomes:      List[Dict[str, Any]] = []
+
+
+# ── Performance Tracker / Central Brain schemas ────────────────────────── #
+
+class TradeFingerprintSchema(BaseModel):
+    """8-component pattern fingerprint."""
+    mode:              str
+    wave_state:        str
+    direction:         str
+    retrace_zone:      str
+    session:           str
+    volatility:        str
+    hour:              int
+    dow:               int
+
+
+class PreTradeConsultationSchema(BaseModel):
+    """Result of mandatory pre-trade pipeline gate."""
+    should_trade:     bool
+    win_probability:  float
+    loss_risk:        float
+    authority:        str    # CLEAR | RESTRICTED | BLOCKED
+    block_reason:     str
+    pattern_known:    bool
+    pattern_win_rate: float
+    global_win_rate:  float
+    priority_boost:   float
+    consultation_id:  str
+    timestamp:        float
+
+
+class PatternSummarySchema(BaseModel):
+    """Summary of a single win or loss pattern."""
+    fingerprint:  TradeFingerprintSchema
+    win_rate:     Optional[float] = None
+    loss_rate:    Optional[float] = None
+    total:        int
+    avg_pnl:      float
+
+
+class PerformanceDashboardSchema(BaseModel):
+    """Full performance dashboard — central brain status."""
+    total_recorded:       int
+    pattern_count:        int
+    global_win_rate:      float
+    global_profit_factor: float
+    global_avg_rr:        float
+    global_expectancy:    float
+    global_sample_size:   int
+    consecutive_losses:   int
+    win_patterns_count:   int
+    loss_patterns_count:  int
+    top_win_patterns:     List[PatternSummarySchema] = []
+    top_loss_patterns:    List[PatternSummarySchema] = []
+    last_consultation:    Optional[Dict[str, Any]] = None
