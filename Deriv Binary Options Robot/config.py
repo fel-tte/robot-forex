@@ -94,3 +94,73 @@ WAVE_CORRECTION_MAX = 0.80      # 80%
 
 # Dung sai xác nhận "tại vùng Fibonacci" (±% khoảng cách sóng)
 WAVE_FIB_TOLERANCE = 0.015      # ±1.5%
+
+# ============================================================
+# SIMULATOR — Tự mô phỏng (Self-Simulate)
+# ============================================================
+
+# Số nến tải về cho backtest (nhiều hơn CANDLE_COUNT để đủ walk-forward)
+SIM_CANDLE_COUNT      = 200
+
+# Số nến sau điểm vào để xác định kết quả thắng/thua
+# (5 nến × GRANULARITY 60s = 5 phút ~ CONTRACT_DURATION)
+SIM_LOOKAHEAD_CANDLES = 5
+
+# Tỉ lệ payout binary options (85% → thắng nhận 85%, thua mất 100%)
+SIM_PAYOUT_RATIO      = 0.85
+
+# Stake giả dùng khi mô phỏng
+SIM_STAKE_USD         = 10.0
+
+# ============================================================
+# LEARNER — Tự học (Self-Learn)
+# ============================================================
+
+# Cần ít nhất N lệnh trong lịch sử mới học
+LEARNER_MIN_HISTORY     = 20
+
+# Học lại sau mỗi N chu kỳ vận hành
+LEARNER_INTERVAL_CYCLES = 10
+
+# Win rate < ngưỡng này → điều kiện tín hiệu bị đánh dấu "yếu"
+LEARNER_WEAK_WIN_RATE   = 0.45   # 45%
+
+# ============================================================
+# PREDICTOR — Tự dự đoán (Self-Predict)
+# ============================================================
+
+# Xác suất thắng tối thiểu để predictor cho phép vào lệnh
+PREDICT_MIN_WIN_PROB      = 0.54
+
+# Mức tự tin tối thiểu để vào lệnh
+PREDICT_MIN_CONFIDENCE    = 0.30
+
+# Ngưỡng ATR tương đối (ATR / price) xác định biến động cao/thấp
+PREDICT_HIGH_VOLATILITY_ATR = 0.005   # > 0.5% → biến động cao
+PREDICT_LOW_VOLATILITY_ATR  = 0.001   # < 0.1% → biến động thấp
+
+# ============================================================
+# DECISION ENGINE — Điều khiển nhịp vận hành
+# ============================================================
+
+# Chạy backtest simulation cho tất cả markets khi khởi động
+ENGINE_RUN_SIM_ON_START = True
+
+# Thời gian nghỉ (giây) khi self-heal phát hiện lỗi liên tiếp
+HEAL_COOLDOWN_SECONDS   = 60
+
+# ============================================================
+# SCALER — Tự scale (Self-Scale)
+# ============================================================
+
+# Cần ít nhất N lệnh để đủ cơ sở scale
+SCALE_MIN_TRADES      = 15
+
+# Win rate >= ngưỡng này → mở rộng pool thị trường
+SCALE_HIGH_WIN_RATE   = 65.0
+
+# Win rate < ngưỡng này → thu hẹp pool thị trường
+SCALE_LOW_WIN_RATE    = 45.0
+
+# Kiểm tra scale mỗi N chu kỳ
+SCALE_INTERVAL_CYCLES = 20
