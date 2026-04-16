@@ -198,7 +198,7 @@ MEMORY_MIN_SAMPLES_FOR_RULE  = 3
 
 # Tỉ lệ thua tối thiểu để đưa fingerprint vào danh sách chặn cứng
 # Fingerprint có loss_rate >= ngưỡng này → luật cứng: BLOCK
-MEMORY_HARD_BLOCK_LOSS_RATE  = 0.40      # >= 40% thua → chặn cứng
+MEMORY_HARD_BLOCK_LOSS_RATE  = 0.20      # >= 20% thua → chặn cứng (Hard Rule bắt buộc theo pipeline)
 
 # Tỉ lệ thắng tốt để tăng ưu tiên (priority boost) cho fingerprint
 MEMORY_STRONG_WIN_RATE       = 0.65      # >= 65% thắng → bonus ưu tiên
