@@ -232,18 +232,6 @@ class WaveDetector:
     sideways_candles : int     Min candles within range to call SIDEWAYS (default 10)
     atr_period : int    ATR smoothing period (default 14)
     """
-    """
-    Parameters
-    ----------
-    htf_ema_fast : int   Higher-TF fast EMA period (default 21)
-    htf_ema_slow : int   Higher-TF slow EMA period (default 50)
-    ltf_ema_fast : int   Lower-TF fast EMA period  (default 8)
-    ltf_ema_slow : int   Lower-TF slow EMA period  (default 21)
-    fractal_period : int Fractal lookback left + right bars (default 2)
-    sideways_atr_mult : float  Price range / ATR threshold for sideways (default 1.5)
-    sideways_candles : int     Min candles within range to call SIDEWAYS (default 10)
-    atr_period : int    ATR smoothing period (default 14)
-    """
 
     def __init__(
         self,
