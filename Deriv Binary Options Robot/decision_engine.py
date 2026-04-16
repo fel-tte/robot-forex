@@ -41,6 +41,10 @@ from logger       import TradeLogger, TradeRecord
 from learner      import Learner
 from predictor    import predict, Prediction
 from simulator    import simulate
+from pipeline     import (
+    TradeQueue, PermissionGate, LoadLimiter,
+    PipelineMetrics, Orchestrator, QueuedTrade, TradeOutcome,
+)
 import deriv_data
 
 
@@ -83,6 +87,14 @@ class DecisionEngine:
         self.risk    = RiskManager()
         self.logger  = TradeLogger()
         self.learner = Learner()
+
+        # Pipeline components
+        self._pipeline = Orchestrator(
+            queue   = TradeQueue(),
+            gate    = PermissionGate(),
+            limiter = LoadLimiter(),
+            metrics = PipelineMetrics(),
+        )
 
         self._consecutive_errors = 0
         self._active_symbols     = self._load_active_symbols()
@@ -230,11 +242,19 @@ class DecisionEngine:
     # ── ④ tự hành động ───────────────────────────────────────────
 
     def run_live_cycle(self, balance: float) -> None:
-        """Chạy một chu kỳ giao dịch thật."""
-        ts = datetime.now()
-        print(f"\n  [Scanning {len(self._active_symbols)} markets + wave + predict]")
+        """
+        Chạy một chu kỳ giao dịch thật — sử dụng pipeline.
 
-        # Quét thị trường
+        Chu kỳ chia thành 2 bước:
+          A) SCAN + SUBMIT: quét thị trường, đưa tín hiệu tốt nhất vào hàng đợi
+          B) DISPATCH: lấy từ hàng đợi, kiểm tra cổng quyền hạn + tải, thực thi
+
+        Không còn "đặt lệnh ngay lập tức" — tín hiệu qua hàng đợi và cổng kiểm soát.
+        """
+        ts = datetime.now()
+        print(f"\n  [Pipeline] Scanning {len(self._active_symbols)} markets...")
+
+        # ── Bước A: Quét thị trường, tạo tín hiệu ─────────────────
         try:
             best = pick_best_entry(symbols=self._active_symbols)
         except Exception as exc:
@@ -242,97 +262,146 @@ class DecisionEngine:
             self._consecutive_errors += 1
             return
 
-        if best is None:
-            print("  ⏳ Không có tín hiệu — chờ chu kỳ tiếp theo.")
-            return
+        if best is not None:
+            # Lấy dữ liệu nến để predictor phân tích
+            try:
+                df = deriv_data.fetch_candles(symbol=best.symbol)
+            except Exception:
+                df = None
 
-        # Lấy dữ liệu để predictor phân tích
-        try:
-            df = deriv_data.fetch_candles(symbol=best.symbol)
-        except Exception:
-            df = None
+            # ② tự quyết định — tính win_prob + confidence
+            should_enter, pred = self.decide_entry(best, df, balance)
 
-        # ② tự quyết định
-        should_enter, pred = self.decide_entry(best, df, balance)
+            # Tính stake
+            if pred and pred.stake_suggestion > 0:
+                stake = pred.stake_suggestion
+            else:
+                params = self.learner.get_params()
+                stake  = round(
+                    self.risk.compute_stake(best.score, balance) * params.stake_multiplier,
+                    2,
+                )
+                stake = max(config.STAKE_MIN_USD, min(config.STAKE_MAX_USD, stake))
 
-        if not should_enter:
-            reason = pred.reason if pred else "Score hoặc điều kiện không đạt"
-            print(f"  🚫 Predictor từ chối: {reason}")
-            return
+            win_prob    = pred.win_prob    if pred else 0.50
+            confidence  = pred.confidence  if pred else 0.30
+            wave_active = bool(best.wave and best.wave.correction_active)
+            fib_zone    = best.wave.fib_zone if best.wave else "NONE"
 
-        # Tính stake cuối cùng
-        if pred and pred.stake_suggestion > 0:
-            stake = pred.stake_suggestion
+            priority = best.score * win_prob * confidence
+
+            queued = QueuedTrade(
+                priority    = priority,
+                enqueued_at = time.time(),
+                symbol      = best.symbol,
+                direction   = best.direction,
+                score       = best.score,
+                win_prob    = win_prob,
+                confidence  = confidence,
+                stake       = stake,
+                wave_active = wave_active,
+                fib_zone    = fib_zone,
+                signal_ref  = best,
+            )
+
+            submitted = self._pipeline.submit(queued)
+            if submitted:
+                print(
+                    f"  [Queue] ✅ Thêm vào hàng đợi: {best.symbol} {best.direction}  "
+                    f"score={best.score:.0f}  wp={win_prob:.2f}  "
+                    f"priority={priority:.1f}"
+                )
+            # else: queue đầy, đã in bên trong submit
         else:
-            params = self.learner.get_params()
-            stake  = round(
-                self.risk.compute_stake(best.score, balance) * params.stake_multiplier,
-                2,
-            )
-            stake  = max(config.STAKE_MIN_USD, min(config.STAKE_MAX_USD, stake))
+            print("  ⏳ Không có tín hiệu đủ điều kiện.")
 
-        # Hiển thị trước khi đặt lệnh
-        pred_info = ""
-        if pred:
-            pred_info = (
-                f"\n  [Predict] win_prob={pred.win_prob:.2f}  "
-                f"confidence={pred.confidence:.2f}  "
-                f"wave_boost={pred.wave_boost:+.3f}"
-            )
+        # ── Hiển thị trạng thái hàng đợi ─────────────────────────
+        self._pipeline.print_queue_status()
 
-        if best.wave and best.wave.correction_active:
-            wave_info = (
-                f"\n  [Wave] {best.wave.main_direction}  "
-                f"hồi={best.wave.correction_depth_pct:.1f}%  "
-                f"Fib={best.wave.fib_zone}  "
-                f"S/R={'✓' if best.wave.at_support_resistance else '✗'}  "
-                f"TP={best.wave.tp_price}  SL={best.wave.sl_price}"
-            )
-        else:
-            wave_info = ""
+        # ── Bước B: Dispatch — lấy + kiểm tra + thực thi ─────────
+        allowed, _ = self.risk.can_trade(balance=balance)
 
-        print(
-            f"  ⚡ {best.symbol} {best.direction}  "
-            f"score={best.score}  stake={stake:.2f} USD"
-            f"{pred_info}{wave_info}"
+        outcome = self._pipeline.dispatch(
+            balance        = balance,
+            risk_can_trade = allowed,
+            executor_fn    = self._execute_trade,
         )
 
-        # ④ tự hành động — đặt lệnh thật
+        if outcome is None:
+            print("  [Dispatch] Không có lệnh nào được thực thi chu kỳ này.")
+            return
+
+        if outcome.rejected_by:
+            # Bị từ chối bởi gate — không thực thi
+            return
+
+        # Cập nhật risk + ghi log
+        self.risk.update_after_trade(won=outcome.won, pnl=outcome.pnl)
+        status    = "✅ THẮNG" if outcome.won else "❌ THUA"
+        print(
+            f"\n  {status}  {outcome.symbol} {outcome.direction}  "
+            f"P&L: {outcome.pnl:+.2f} USD  latency={outcome.latency_ms:.0f}ms"
+        )
+        self._consecutive_errors = 0
+
+    # ── Executor function (được truyền vào Orchestrator) ─────────
+
+    def _execute_trade(self, trade: QueuedTrade) -> Optional[dict]:
+        """
+        Thực thi lệnh thật và ghi log.
+        Được gọi bởi Orchestrator.dispatch() sau khi vượt qua tất cả cổng.
+
+        Returns dict kết quả hoặc None nếu thất bại.
+        """
+        ts = datetime.now()
+
+        if trade.wave_active:
+            signal = trade.signal_ref
+            wave   = signal.wave if signal else None
+            print(
+                f"  [Execute] {trade.symbol} {trade.direction}  "
+                f"score={trade.score:.0f}  stake={trade.stake:.2f} USD  "
+                + (
+                    f"Fib={trade.fib_zone}  "
+                    f"TP={wave.tp_price}  SL={wave.sl_price}"
+                    if wave else ""
+                )
+            )
+        else:
+            print(
+                f"  [Execute] {trade.symbol} {trade.direction}  "
+                f"score={trade.score:.0f}  stake={trade.stake:.2f} USD"
+            )
+
         try:
-            result = place_and_wait(best.direction, best.symbol, stake)
-            self._consecutive_errors = 0   # Reset counter khi thành công
+            result = place_and_wait(trade.direction, trade.symbol, trade.stake)
         except Exception as exc:
             print(f"  [LỖI] Đặt lệnh thất bại: {exc}")
             self._consecutive_errors += 1
-            return
+            return None
 
         won    = result["won"]
         pnl    = result["pnl"]
         payout = result.get("payout", 0)
 
-        # Ghi log (bao gồm wave + predict metadata trong indicators)
+        signal = trade.signal_ref
         record = TradeRecord(
             timestamp    = ts.isoformat(),
-            symbol       = best.symbol,
-            direction    = best.direction,
-            signal_score = best.score,
-            stake        = stake,
+            symbol       = trade.symbol,
+            direction    = trade.direction,
+            signal_score = trade.score,
+            stake        = trade.stake,
             payout       = payout,
             pnl          = pnl,
             won          = won,
             contract_id  = result.get("contract_id", ""),
-            rsi          = best.rsi,
-            momentum     = best.momentum,
-            macd_hist    = best.macd_hist,
-            bb_position  = best.bb_position,
+            rsi          = signal.rsi          if signal else 0.0,
+            momentum     = signal.momentum     if signal else 0.0,
+            macd_hist    = signal.macd_hist    if signal else 0.0,
+            bb_position  = signal.bb_position  if signal else 0.0,
         )
         self.logger.log(record)
-        self.risk.update_after_trade(won=won, pnl=pnl)
-
-        # Kết quả
-        status    = "✅ THẮNG" if won else "❌ THUA"
-        pred_text = f"  pred_win={pred.win_prob:.2f}" if pred else ""
-        print(f"\n  {status}  P&L: {pnl:+.2f} USD{pred_text}")
+        return result
 
     # ── ⑤ tự sửa lỗi ─────────────────────────────────────────────
 
@@ -452,11 +521,12 @@ class DecisionEngine:
 
     def print_dashboard(self, balance: float, mode: SystemMode) -> None:
         """In dashboard giám sát cho operator."""
-        params = self.learner.get_params()
+        params    = self.learner.get_params()
         mode_icon = {"LIVE": "🟢", "PAPER": "📄", "PAUSED": "⏸️", "LEARNING": "🧠"}.get(mode.value, "⚪")
+        metrics   = self._pipeline._metrics.snapshot()
 
         print(f"\n{'='*65}")
-        print(f"  👁️  DECISION ENGINE  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  👁️  DECISION ENGINE + PIPELINE  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*65}")
         print(f"  Mode     : {mode_icon} {mode.value}  |  Balance: {balance:.2f} USD")
         print(
@@ -469,11 +539,18 @@ class DecisionEngine:
             f"weak_conds={len(params.weak_conditions)}"
         )
         learn_in = config.LEARNER_INTERVAL_CYCLES - (self._cycle_count % config.LEARNER_INTERVAL_CYCLES)
-        scale_in = config.SCALE_INTERVAL_CYCLES  - (self._cycle_count % config.SCALE_INTERVAL_CYCLES)
+        scale_in = config.SCALE_INTERVAL_CYCLES   - (self._cycle_count % config.SCALE_INTERVAL_CYCLES)
         print(
             f"  Cycle    : #{self._cycle_count}  |  "
             f"Errors: {self._consecutive_errors}  |  "
             f"Learn in: {learn_in}  |  Scale in: {scale_in}"
+        )
+        # Pipeline metrics summary
+        print(
+            f"  Pipeline : submitted={metrics['total_submitted']}  "
+            f"executed={metrics['total_executed']}  "
+            f"rejected={metrics['total_rejected']} ({metrics['rejection_rate_pct']:.0f}%)  "
+            f"throughput={metrics['throughput_per_h']:.1f}/h"
         )
 
     # ── Master run loop ───────────────────────────────────────────
@@ -484,8 +561,10 @@ class DecisionEngine:
         Bạn chỉ cần giám sát.
         """
         print("\n" + "=" * 65)
-        print("  🚀 DECISION ENGINE + CONTROL SYSTEM — ONLINE")
-        print("  Hệ thống tự vận hành hoàn toàn. Bạn chỉ cần giám sát.")
+        print("  🚀 DECISION ENGINE + PIPELINE — ONLINE")
+        print("  Hệ thống vận hành như tổ chức thật:")
+        print("  có hàng đợi  |  có quyền hạn  |  có giới hạn tải")
+        print("  có control   |  có đo lường   |  có điều phối")
         print("=" * 65)
         print(f"  Pool ban đầu    : {', '.join(self._active_symbols)}")
         print(f"  Mode ban đầu    : {self._mode.value}")
@@ -494,6 +573,13 @@ class DecisionEngine:
         print(f"  Predict min WP  : {config.PREDICT_MIN_WIN_PROB:.0%}")
         print(f"  Giới hạn lỗ ngày: {config.RISK_MAX_DAILY_LOSS_PCT*100:.0f}%")
         print(f"  Chu kỳ quét     : {config.SCAN_INTERVAL_SECONDS}s")
+        print(f"  Hàng đợi max    : {config.PIPELINE_MAX_QUEUE_DEPTH} lệnh")
+        print(
+            f"  Rate limit      : {config.PIPELINE_RATE_MAX_TRADES} lệnh "
+            f"/ {config.PIPELINE_RATE_WINDOW_SECONDS}s  "
+            f"|  gap tối thiểu: {config.PIPELINE_MIN_TRADE_GAP_SECONDS}s"
+        )
+        print(f"  Authority gates : cần {config.PIPELINE_MIN_AUTHORITY_GATES}/3 cổng")
         print("=" * 65)
 
         # Chạy simulation ban đầu trước khi vào vòng lặp
@@ -543,16 +629,21 @@ class DecisionEngine:
                     if self._cycle_count % config.SCALE_INTERVAL_CYCLES == 0:
                         self.self_scale()
 
-                    # ④ tự hành động
+                    # ④ tự hành động — qua pipeline
                     self.run_live_cycle(balance=balance)
 
                 print(f"\n  {self.risk.summary()}")
                 self.logger.print_stats()
 
+                # In pipeline metrics report mỗi 10 chu kỳ
+                if self._cycle_count % 10 == 0:
+                    self._pipeline._metrics.print_report()
+
             except KeyboardInterrupt:
                 print(f"\n  [{datetime.now()}] Operator ngắt hệ thống.")
                 print(f"  {self.risk.summary()}")
                 self.logger.print_stats()
+                self._pipeline._metrics.print_report()
                 break
 
             except Exception as exc:

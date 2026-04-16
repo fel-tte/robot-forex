@@ -164,3 +164,27 @@ SCALE_LOW_WIN_RATE    = 45.0
 
 # Kiểm tra scale mỗi N chu kỳ
 SCALE_INTERVAL_CYCLES = 20
+
+# ============================================================
+# PIPELINE — Dây chuyền điều phối vận hành
+# ============================================================
+
+# Số lệnh tối đa trong hàng đợi cùng lúc
+PIPELINE_MAX_QUEUE_DEPTH     = 3
+
+# Số lệnh tối đa đang chờ xử lý trong 1 cửa sổ thời gian
+# (giới hạn tải — rate limiting)
+PIPELINE_RATE_WINDOW_SECONDS = 300    # 5 phút
+PIPELINE_RATE_MAX_TRADES     = 3      # Tối đa 3 lệnh / 5 phút
+
+# Khoảng cách tối thiểu giữa 2 lệnh liên tiếp (giây)
+# Ngăn "đặt lệnh liên tục" — load spacing
+PIPELINE_MIN_TRADE_GAP_SECONDS = 30
+
+# Điểm quyền hạn tối thiểu để lệnh vượt qua cổng xác nhận
+# Tổng điểm quyền hạn = signal_score_gate + predictor_gate + risk_gate
+# Mỗi cổng đóng góp True/False → tổng tối đa 3
+PIPELINE_MIN_AUTHORITY_GATES  = 2     # Cần ít nhất 2/3 cổng thông qua
+
+# Kích thước cửa sổ đo lường (giây)
+PIPELINE_METRICS_WINDOW_SECONDS = 3600   # Tính metrics trên 1 giờ gần nhất
