@@ -74,3 +74,23 @@ REDIS_LOG_KEY     = "Deriv_Trade_Log"      # List: lịch sử lệnh (JSON)
 
 # --- File log giao dịch ---
 TRADE_LOG_FILE = "trade_log.csv"
+
+# ============================================================
+# Hệ thống PHÂN TÍCH SÓNG (Wave Analyzer — Operator System)
+# ============================================================
+
+# Cửa sổ rolling để phát hiện đỉnh/đáy (Swing High/Low)
+WAVE_SWING_ORDER = 5
+
+# Kích thước tối thiểu của sóng chính (% so với giá hiện tại)
+# Sóng nhỏ hơn ngưỡng này bị bỏ qua
+WAVE_MIN_SIZE_PCT = 0.005       # 0.5% giá
+
+# Biên sóng hồi hợp lệ: [min%, max%] của sóng chính
+# < 20%  → chưa đủ sâu để tính là sóng hồi
+# > 80%  → có thể là đảo chiều, không phải hồi
+WAVE_CORRECTION_MIN = 0.20      # 20%
+WAVE_CORRECTION_MAX = 0.80      # 80%
+
+# Dung sai xác nhận "tại vùng Fibonacci" (±% khoảng cách sóng)
+WAVE_FIB_TOLERANCE = 0.015      # ±1.5%
