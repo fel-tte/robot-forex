@@ -54,10 +54,10 @@ _SEGMENT_WINDOW         = 30    # sliding window per (mode, wave_state) segment
 _GLOBAL_WINDOW          = 200   # global rolling window
 _PATTERN_WINDOW         = 50    # max trades per pattern fingerprint
 _MIN_PATTERN_SAMPLES    = 8     # minimum trades before a pattern is trusted
-_HARD_BLOCK_LOSS_RATE   = 0.70  # pattern loss_rate >= this → HARD BLOCK
+_HARD_BLOCK_LOSS_RATE   = 0.40  # pattern loss_rate >= this → HARD BLOCK
 _WIN_PATTERN_THRESHOLD  = 0.62  # win_rate >= this → WIN pattern
 _LOSS_PATTERN_THRESHOLD = 0.38  # win_rate <= this → LOSS pattern (risky)
-_GLOBAL_LOSS_LIMIT      = 7     # consecutive global losses → GLOBAL BLOCK
+_GLOBAL_LOSS_LIMIT      = 4     # consecutive global losses → GLOBAL BLOCK
 _MIN_GLOBAL_WIN_RATE    = 0.40  # global win_rate below this → RESTRICTED
 _MIN_GLOBAL_SAMPLES     = 15    # global samples required before RESTRICTED kicks in
 
