@@ -42,3 +42,35 @@ REDIS_HASH_KEY = "Deriv_Binary_Signal"
 
 # --- Scheduler ---
 SCAN_INTERVAL_SECONDS = 60  # Kiểm tra tín hiệu mỗi N giây
+
+# ============================================================
+# Hệ thống TỰ VẬN HÀNH
+# ============================================================
+
+# --- Danh sách thị trường tự quét ---
+# Robot sẽ tự chọn thị trường tốt nhất trong danh sách này
+SCAN_SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100"]
+
+# --- Ngưỡng chất lượng tín hiệu ---
+# Robot chỉ đặt lệnh khi điểm tín hiệu >= ngưỡng này (0-100)
+MIN_SIGNAL_SCORE = 60
+
+# --- Quản lý rủi ro tự động ---
+RISK_MAX_DAILY_LOSS_PCT  = 0.20   # Dừng giao dịch khi lỗ >= 20% số dư ban đầu trong ngày
+RISK_MAX_CONSECUTIVE_LOSS = 5     # Dừng tạm thời sau N lần thua liên tiếp
+RISK_COOLDOWN_MINUTES     = 30    # Nghỉ bao nhiêu phút sau chuỗi thua
+
+# --- Quản lý kích thước lệnh tự động ---
+# Dựa trên điểm tín hiệu (0-100) và số dư tài khoản
+STAKE_PCT_HIGH   = 0.05   # score >= 80 → 5% số dư
+STAKE_PCT_MEDIUM = 0.03   # score 60-79 → 3% số dư
+STAKE_PCT_LOW    = 0.02   # score < 60  → 2% số dư (fallback)
+STAKE_MIN_USD    = 1.0    # Lệnh tối thiểu (USD)
+STAKE_MAX_USD    = 50.0   # Lệnh tối đa (USD)
+
+# --- Redis keys cho trạng thái tự vận hành ---
+REDIS_STATE_KEY   = "Deriv_Robot_State"    # Hash: trạng thái rủi ro
+REDIS_LOG_KEY     = "Deriv_Trade_Log"      # List: lịch sử lệnh (JSON)
+
+# --- File log giao dịch ---
+TRADE_LOG_FILE = "trade_log.csv"

@@ -1,7 +1,9 @@
-# Deriv Binary Options Robot 🤖
+# Deriv Binary Options Robot 🤖 — Hệ thống Tự Vận Hành
 
-Robot giao dịch tự động Binary Options trên nền tảng **Deriv**, sử dụng chiến lược **RSI + Momentum**.  
-Kiến trúc kế thừa từ khoá học `robot-forex` (Redis signal bus + Scheduler).
+Robot giao dịch **tự vận hành hoàn toàn** trên nền tảng **Deriv**, được xây dựng theo kiến trúc khoá học `robot-forex`.
+
+> Robot **tự quyết định làm gì trước**, **tự chọn điểm vào lệnh tốt nhất**,  
+> **tự điều phối tài nguyên** và **gần như tự vận hành hoàn toàn**.
 
 ---
 
@@ -9,11 +11,14 @@ Kiến trúc kế thừa từ khoá học `robot-forex` (Redis signal bus + Sche
 
 ```
 Deriv Binary Options Robot/
-├── config.py        # Cấu hình: API token, symbol, tham số giao dịch
+├── config.py        # Tất cả cấu hình: API, symbol, risk, autonomous params
 ├── deriv_data.py    # Lấy dữ liệu nến từ Deriv WebSocket API
-├── strategy.py      # Tính RSI + Momentum → sinh tín hiệu → Redis
-├── deriv_trade.py   # Đọc tín hiệu từ Redis → đặt lệnh CALL/PUT
-├── robot.py         # Robot chính: kết hợp tất cả + scheduler
+├── brain.py         # 🧠 Bộ não: quét nhiều thị trường, tính điểm tín hiệu 0-100
+├── risk_manager.py  # 🛡️  Quản lý rủi ro: stake động, giới hạn lỗ, cooldown
+├── logger.py        # 📝 Nhật ký giao dịch: CSV + Redis, thống kê hiệu suất
+├── strategy.py      # Chiến lược đơn (RSI+Momentum) — dùng độc lập nếu cần
+├── deriv_trade.py   # Đặt lệnh CALL/PUT, chờ kết quả từ Deriv API
+├── robot.py         # 🤖 Vòng lặp tự vận hành chính — chỉ cần chạy file này
 └── README.md        # Tài liệu này
 ```
 
@@ -24,19 +29,17 @@ Deriv Binary Options Robot/
 ### 1. Cài thư viện Python
 
 ```bash
-pip install websockets pandas redis schedule
+pip install websockets pandas numpy redis
 ```
 
 ### 2. Cài và khởi động Redis
 
 ```bash
 # Ubuntu/Debian
-sudo apt install redis-server
-sudo service redis-server start
+sudo apt install redis-server && sudo service redis-server start
 
 # macOS
-brew install redis
-brew services start redis
+brew install redis && brew services start redis
 ```
 
 ### 3. Lấy Deriv API Token
@@ -44,13 +47,13 @@ brew services start redis
 1. Đăng nhập tại [app.deriv.com](https://app.deriv.com)
 2. Vào **Settings → API Token**
 3. Tạo token với quyền **Trade** và **Read**
-4. Copy token và dán vào `config.py`:
+4. Dán vào `config.py`:
 
 ```python
 DERIV_API_TOKEN = "your_real_token_here"
 ```
 
-> ⚠️ **Khuyến nghị**: Hãy test với tài khoản **Demo** trước khi dùng tài khoản thật.
+> ⚠️ Hãy test với tài khoản **Demo** trước.
 
 ---
 
@@ -59,72 +62,88 @@ DERIV_API_TOKEN = "your_real_token_here"
 ```bash
 cd "Deriv Binary Options Robot"
 
-# Chạy robot hoàn chỉnh (phân tích + đặt lệnh tự động)
+# Chạy robot tự vận hành
 python robot.py
-
-# Hoặc chạy từng module riêng để kiểm tra:
-python deriv_data.py    # Test lấy dữ liệu nến
-python strategy.py      # Test tính tín hiệu RSI + Momentum
-python deriv_trade.py   # Test đặt lệnh (cần token hợp lệ)
 ```
 
 ---
 
-## 📊 Chiến lược giao dịch
+## 🏗️ Kiến trúc Tự Vận Hành
 
-| Tín hiệu | Điều kiện | Lệnh |
-|----------|-----------|------|
-| **MUA (CALL)** | RSI vừa vượt lên khỏi vùng quá bán (< 30) **VÀ** Momentum > 0 | Đặt hợp đồng CALL |
-| **BÁN (PUT)**  | RSI vừa rơi xuống từ vùng quá mua (> 70) **VÀ** Momentum < 0 | Đặt hợp đồng PUT  |
-| Không có | Các trường hợp còn lại | Không đặt lệnh |
+```
+                    ┌──────────────────────────────────────┐
+                    │         robot.py  (vòng lặp)         │
+                    │                                      │
+   ① Tự quyết      │   brain.pick_best_entry()            │◄─── SCAN_SYMBOLS
+      làm gì trước │      quét R_10/R_25/R_50/R_75/R_100  │
+                    │      tính điểm 0-100 cho từng thị   │
+                    │      trường, chọn điểm cao nhất      │
+                    │                                      │
+   ② Tự chọn       │   [brain.py] score = RSI(30pt)       │
+      điểm vào     │              + Momentum(20pt)         │
+      tốt nhất     │              + MACD(25pt)             │
+                    │              + Bollinger(25pt)        │
+                    │                                      │
+   ③ Tự điều phối  │   risk_manager.can_trade()           │
+      tài nguyên   │      - kiểm tra giới hạn lỗ ngày     │
+                    │      - kiểm tra cooldown chuỗi thua  │
+                    │   risk_manager.compute_stake()       │
+                    │      - score≥80 → 5% số dư           │
+                    │      - score 60-79 → 3% số dư        │
+                    │                                      │
+   ④ Tự vận hành   │   deriv_trade.place_and_wait()       │──► Deriv API
+                    │      đặt CALL/PUT, chờ kết quả       │
+                    │   logger.log()                       │──► trade_log.csv
+                    │   risk_manager.update_after_trade()  │──► Redis state
+                    │                                      │
+                    │   [tự phục hồi lỗi, lặp vô tận]     │
+                    └──────────────────────────────────────┘
+```
 
 ---
 
 ## ⚙️ Tuỳ chỉnh trong `config.py`
 
+### Cấu hình cơ bản
+
 | Tham số | Mô tả | Mặc định |
 |---------|-------|---------|
-| `SYMBOL` | Mã thị trường | `R_100` (Volatility 100) |
+| `SYMBOL` | Symbol mặc định | `R_100` |
+| `SCAN_SYMBOLS` | Danh sách thị trường tự quét | `R_10 … R_100` |
 | `GRANULARITY` | Khung thời gian nến (giây) | `60` (1 phút) |
-| `RSI_OVERSOLD` | Ngưỡng quá bán | `30` |
-| `RSI_OVERBOUGHT` | Ngưỡng quá mua | `70` |
-| `TRADE_AMOUNT` | Số tiền mỗi lệnh (USD) | `10` |
-| `CONTRACT_DURATION` | Thời hạn hợp đồng | `5` phút |
-| `SCAN_INTERVAL_SECONDS` | Tần suất quét thị trường | `60` giây |
+| `CONTRACT_DURATION` | Thời hạn hợp đồng | `5m` |
+| `SCAN_INTERVAL_SECONDS` | Chu kỳ quét | `60` giây |
+
+### Cấu hình tự vận hành
+
+| Tham số | Mô tả | Mặc định |
+|---------|-------|---------|
+| `MIN_SIGNAL_SCORE` | Điểm tối thiểu để đặt lệnh (0-100) | `60` |
+| `RISK_MAX_DAILY_LOSS_PCT` | Dừng khi lỗ X% số dư trong ngày | `20%` |
+| `RISK_MAX_CONSECUTIVE_LOSS` | Cooldown sau N lần thua liên tiếp | `5` |
+| `RISK_COOLDOWN_MINUTES` | Thời gian cooldown | `30 phút` |
+| `STAKE_PCT_HIGH` | Stake khi score≥80 | `5% số dư` |
+| `STAKE_PCT_MEDIUM` | Stake khi score 60-79 | `3% số dư` |
+| `STAKE_MIN_USD` / `STAKE_MAX_USD` | Giới hạn stake | `1–50 USD` |
 
 ---
 
-## 🏗️ Kiến trúc
+## 📊 Hệ thống tính điểm tín hiệu (brain.py)
 
-```
-┌─────────────────┐    candles    ┌──────────────────┐
-│   Deriv API     │ ─────────────▶│  deriv_data.py   │
-│ (WebSocket)     │               └────────┬─────────┘
-└─────────────────┘                        │ DataFrame
-                                           ▼
-                                  ┌──────────────────┐
-                                  │   strategy.py    │
-                                  │  RSI + Momentum  │
-                                  └────────┬─────────┘
-                                           │ signal dict
-                                           ▼
-                                  ┌──────────────────┐
-                                  │      Redis       │
-                                  │  (hash signal)   │
-                                  └────────┬─────────┘
-                                           │ read signal
-                                           ▼
-                                  ┌──────────────────┐    order    ┌─────────────────┐
-                                  │  deriv_trade.py  │ ───────────▶│   Deriv API     │
-                                  │  CALL / PUT      │             │ (WebSocket)     │
-                                  └──────────────────┘             └─────────────────┘
-```
+| Chỉ báo | Điểm tối đa | Điều kiện tối đa |
+|---------|-------------|-----------------|
+| RSI crossover | 30 | RSI vừa vượt ngưỡng quá bán/mua |
+| Momentum | 20 | Z-score momentum cao |
+| MACD histogram | 25 | MACD histogram vừa đổi chiều |
+| Bollinger Bands | 25 | Giá chạm/vượt dải Bollinger |
+| **Tổng** | **100** | |
 
 ---
 
 ## ⚠️ Cảnh báo rủi ro
 
-- Binary Options là hình thức giao dịch **rủi ro cao**, có thể mất toàn bộ vốn đặt cược.
-- Robot này chỉ là **công cụ học tập**. Không đảm bảo lợi nhuận.
-- Luôn test kỹ với tài khoản **Demo** trước.
+- Binary Options là hình thức giao dịch **rủi ro cao**, có thể mất toàn bộ vốn.
+- Robot này là **công cụ học tập** — không đảm bảo lợi nhuận.
+- Luôn test với tài khoản **Demo** trước khi dùng tiền thật.
 - Không đầu tư số tiền bạn không thể chấp nhận mất.
+
