@@ -46,6 +46,8 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 # ── Window / threshold constants ────────────────────────────────────────── #
@@ -183,6 +185,152 @@ class PreTradeConsultation:
 _SegKey = Tuple[str, str]
 
 
+# ── WinClassifier ─────────────────────────────────────────────────────────── #
+
+class WinClassifier:
+    """
+    XGBoost + Logistic Regression ensemble for win-probability prediction.
+
+    Encodes the 8-component TradeFingerprint into a fixed-length feature
+    vector via one-hot encoding of categorical fields and normalised
+    numerics, then trains a binary classifier (win=1, loss=0).
+
+    Usage
+    -----
+    - ``fit(outcomes)``         — (re)train on a list of TradeOutcome
+    - ``predict_proba(fp)``     — return P(win) for a fingerprint, or None
+    - ``on_new_record()``       — call after each record(); triggers retrain
+                                  when ``needs_retrain()`` is True
+    - ``is_ready``              — True once the model has been trained
+    """
+
+    _MIN_SAMPLES:   int = 30   # minimum labeled samples before first training
+    _RETRAIN_EVERY: int = 10   # retrain every N new trade records
+
+    # Fixed vocabularies for reproducible one-hot encoding
+    _MODE_VOCAB    = ["BREAKOUT", "RETRACE", "RETEST_SAME", "RETRACEMENT"]
+    _WAVE_VOCAB    = ["BULL_MAIN", "BEAR_MAIN", "SIDEWAYS", "SUB_WAVE_UP", "SUB_WAVE_DOWN"]
+    _DIR_VOCAB     = ["BUY", "SELL"]
+    _ZONE_VOCAB    = ["NOT_RETRACING", "GOLDEN_ZONE", "OVERSHOOTING", "SHALLOW"]
+    _SESSION_VOCAB = ["ASIAN", "LONDON", "NEW_YORK", "OFF_HOURS"]
+    _VOL_VOCAB     = ["LOW", "NORMAL", "HIGH", "EXTREME"]
+
+    def __init__(self) -> None:
+        self._xgb_model  = None   # XGBClassifier (primary)
+        self._lr_model   = None   # LogisticRegression (fallback)
+        self._is_ready   = False
+        self._records_since_retrain: int = 0
+        self._total_fitted: int = 0
+
+    # ── Public API ──────────────────────────────────────────────────────── #
+
+    @property
+    def is_ready(self) -> bool:
+        return self._is_ready
+
+    def on_new_record(self) -> None:
+        """Increment counter; caller checks ``needs_retrain()`` afterwards."""
+        self._records_since_retrain += 1
+
+    def needs_retrain(self) -> bool:
+        return self._records_since_retrain >= self._RETRAIN_EVERY
+
+    def fit(self, outcomes: List["TradeOutcome"]) -> None:
+        """(Re)train on all outcomes that carry a fingerprint."""
+        labeled = [o for o in outcomes if o.fingerprint is not None]
+        if len(labeled) < self._MIN_SAMPLES:
+            return
+
+        X = np.array(
+            [self._encode(o.fingerprint) for o in labeled], dtype=np.float32
+        )
+        y = np.array([1 if o.pnl > 0 else 0 for o in labeled], dtype=np.int32)
+
+        n_pos = int(y.sum())
+        n_neg = len(y) - n_pos
+        scale_pos = (n_neg / n_pos) if n_pos > 0 else 1.0
+
+        # ── XGBoost (primary) ──────────────────────────────────────────── #
+        try:
+            import xgboost as xgb  # noqa: PLC0415
+
+            model = xgb.XGBClassifier(
+                n_estimators=50,
+                max_depth=4,
+                learning_rate=0.1,
+                scale_pos_weight=scale_pos,
+                eval_metric="logloss",
+                verbosity=0,
+            )
+            model.fit(X, y)
+            self._xgb_model = model
+            self._is_ready  = True
+            logger.info(
+                "WinClassifier: XGBoost trained on %d samples (pos=%d neg=%d)",
+                len(labeled), n_pos, n_neg,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("WinClassifier: XGBoost unavailable (%s)", exc)
+            self._xgb_model = None
+
+        # ── LogisticRegression (fallback) ──────────────────────────────── #
+        try:
+            from sklearn.linear_model import LogisticRegression  # noqa: PLC0415
+
+            lr = LogisticRegression(max_iter=300, class_weight="balanced", solver="lbfgs")
+            lr.fit(X, y)
+            self._lr_model = lr
+            if not self._is_ready:
+                self._is_ready = True
+                logger.info(
+                    "WinClassifier: LogisticRegression trained on %d samples", len(labeled)
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("WinClassifier: LogisticRegression unavailable (%s)", exc)
+
+        self._total_fitted          = len(labeled)
+        self._records_since_retrain = 0
+
+    def predict_proba(self, fp: "TradeFingerprint") -> Optional[float]:
+        """Return blended P(win) for *fp*, or ``None`` if model not ready."""
+        if not self._is_ready:
+            return None
+        vec = np.array([self._encode(fp)], dtype=np.float32)
+        probs: List[float] = []
+        try:
+            if self._xgb_model is not None:
+                probs.append(float(self._xgb_model.predict_proba(vec)[0, 1]))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("WinClassifier.xgb predict failed: %s", exc)
+        try:
+            if self._lr_model is not None:
+                probs.append(float(self._lr_model.predict_proba(vec)[0, 1]))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("WinClassifier.lr predict failed: %s", exc)
+        if not probs:
+            return None
+        return round(float(sum(probs) / len(probs)), 4)
+
+    # ── Encoding ────────────────────────────────────────────────────────── #
+
+    def _encode(self, fp: "TradeFingerprint") -> List[float]:
+        """One-hot encode a TradeFingerprint into a fixed-length feature vector."""
+
+        def _one_hot(value: str, vocab: List[str]) -> List[float]:
+            return [1.0 if value == v else 0.0 for v in vocab]
+
+        vec: List[float] = []
+        vec.extend(_one_hot(fp.mode,              self._MODE_VOCAB))
+        vec.extend(_one_hot(fp.wave_state,        self._WAVE_VOCAB))
+        vec.extend(_one_hot(fp.direction,         self._DIR_VOCAB))
+        vec.extend(_one_hot(fp.retrace_zone,      self._ZONE_VOCAB))
+        vec.extend(_one_hot(fp.session,           self._SESSION_VOCAB))
+        vec.extend(_one_hot(fp.volatility_regime, self._VOL_VOCAB))
+        vec.append(fp.hour_bucket / 23.0)       # normalised 0–1
+        vec.append(fp.day_of_week / 6.0)        # normalised 0–1
+        return vec
+
+
 # ── PerformanceTracker ─────────────────────────────────────────────────── #
 
 class PerformanceTracker:
@@ -202,6 +350,7 @@ class PerformanceTracker:
         self._pattern_memory:  Dict[TradeFingerprint, PatternRecord] = {}
         self._consultation_log: List[PreTradeConsultation]           = []
         self._total_recorded:  int = 0
+        self._classifier:      WinClassifier                        = WinClassifier()
 
     # ── Core record ─────────────────────────────────────────────────────── #
 
@@ -217,6 +366,11 @@ class PerformanceTracker:
             if fp not in self._pattern_memory:
                 self._pattern_memory[fp] = PatternRecord()
             self._pattern_memory[fp].record(outcome.pnl)
+
+        # ── ML: incremental retrain trigger ──────────────────────────── #
+        self._classifier.on_new_record()
+        if self._classifier.needs_retrain():
+            self._classifier.fit(list(self._global))
 
         logger.debug(
             "PerformanceTracker.record: %s/%s pnl=%.2f rr=%.2f (total=%d)",
@@ -292,15 +446,28 @@ class PerformanceTracker:
             authority = "RESTRICTED"
 
         # ── Win probability estimation ───────────────────────────────── #
+        # Base probability from pattern history or global stats
         if pattern_known and pattern_rec is not None:
-            win_prob  = pattern_rec.win_rate
+            stat_prob = pattern_rec.win_rate
             loss_risk = pattern_rec.loss_rate
         elif global_stats.sample_size >= 5:
-            win_prob  = global_stats.win_rate
-            loss_risk = 1.0 - win_prob
+            stat_prob = global_stats.win_rate
+            loss_risk = 1.0 - stat_prob
         else:
-            win_prob  = 0.5
+            stat_prob = 0.5
             loss_risk = 0.5
+
+        # ML-enhanced probability: blend classifier output with stats
+        ml_prob = self._classifier.predict_proba(fingerprint)
+        if ml_prob is not None:
+            win_prob  = round(0.5 * ml_prob + 0.5 * stat_prob, 4)
+            loss_risk = round(1.0 - win_prob, 4)
+            logger.debug(
+                "WinClassifier: ml_prob=%.3f stat_prob=%.3f blended=%.3f",
+                ml_prob, stat_prob, win_prob,
+            )
+        else:
+            win_prob = stat_prob
 
         # ── Priority boost for known WIN patterns ────────────────────── #
         priority_boost = 0.0

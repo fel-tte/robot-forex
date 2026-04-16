@@ -66,6 +66,146 @@ from .retracement_engine import RetracementMeasure
 
 logger = logging.getLogger(__name__)
 
+
+# ── EnsembleScorer ─────────────────────────────────────────────────────── #
+
+class EnsembleScorer:
+    """
+    Soft-voting ensemble (GradientBoosting + RandomForest + LogisticRegression)
+    for predicting whether the *next* entered trade will be profitable.
+
+    The predicted probability replaces / blends with the hand-crafted
+    ``continuation_prob`` formula inside ``DecisionEngine._predict_regime()``.
+
+    Training pipeline (deferred / incremental)
+    ------------------------------------------
+    1. ``record_pending(features)`` — called in ``decide()`` once per
+       new-trade search (when ``_pending`` is unset).
+    2. ``label_pending(win)``       — called in ``record_outcome()`` with
+       the actual trade result; appends *(features, label)* to buffer.
+    3. ``_fit_if_ready()``         — retrain once ``_MIN_SAMPLES`` reached
+       and every ``_RETRAIN_EVERY`` new labeled samples afterwards.
+
+    Cold-start
+    ----------
+    While ``is_ready == False`` the caller uses the original rule-based
+    formula unchanged.
+    """
+
+    _MIN_SAMPLES:   int = 40   # minimum labeled pairs before first training
+    _RETRAIN_EVERY: int = 15   # retrain every N new labeled samples
+
+    # Feature names (in order) — for documentation
+    _FEATURE_NAMES = [
+        "ema_score", "direction_score", "wave_confidence",
+        "atr_percentile", "sub_wave_penalty",
+        "vol_regime_norm", "cons_losses_norm",
+        "global_win_rate", "global_pf_norm",
+    ]
+
+    def __init__(self) -> None:
+        self._model:   object = None
+        self._is_ready = False
+        self._buffer:  List[Tuple[List[float], int]] = []
+        self._pending: Optional[List[float]]         = None
+        self._records_since_retrain: int             = 0
+
+    # ── Public API ──────────────────────────────────────────────────────── #
+
+    @property
+    def is_ready(self) -> bool:
+        return self._is_ready
+
+    def extract_features(
+        self,
+        ema_score:        float,
+        direction_score:  float,
+        wave_conf:        float,
+        atr_percentile:   float,
+        sub_wave_penalty: float,
+        vol_regime:       str,
+        cons_losses:      int,
+        global_wr:        float,
+        global_pf:        float,
+    ) -> List[float]:
+        """Build a fixed-length feature vector from current market state."""
+        _vol_map = {"LOW": 0.0, "NORMAL": 0.33, "HIGH": 0.67, "EXTREME": 1.0}
+        return [
+            float(ema_score),
+            float(direction_score),
+            float(wave_conf),
+            float(atr_percentile),
+            float(sub_wave_penalty),
+            _vol_map.get(vol_regime, 0.33),
+            min(cons_losses / 10.0, 1.0),
+            float(global_wr),
+            min(global_pf / 3.0, 1.0),
+        ]
+
+    def record_pending(self, features: List[float]) -> None:
+        """Store regime features to be labeled when the next trade closes."""
+        if self._pending is None:
+            self._pending = features
+
+    def label_pending(self, win: bool) -> None:
+        """Attach the trade outcome to the pending feature vector."""
+        if self._pending is None:
+            return
+        self._buffer.append((self._pending, 1 if win else 0))
+        self._pending = None
+        self._records_since_retrain += 1
+        self._fit_if_ready()
+
+    def predict(self, features: List[float]) -> Optional[float]:
+        """Return ensemble P(win), or ``None`` if model not ready."""
+        if not self._is_ready or self._model is None:
+            return None
+        try:
+            X = np.array([features], dtype=np.float32)
+            return round(float(self._model.predict_proba(X)[0, 1]), 4)  # type: ignore[union-attr]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("EnsembleScorer.predict: %s", exc)
+            return None
+
+    # ── Internal helpers ────────────────────────────────────────────────── #
+
+    def _fit_if_ready(self) -> None:
+        if len(self._buffer) < self._MIN_SAMPLES:
+            return
+        if self._records_since_retrain < self._RETRAIN_EVERY and self._is_ready:
+            return
+        self._train()
+
+    def _train(self) -> None:
+        try:
+            from sklearn.ensemble import (  # noqa: PLC0415
+                GradientBoostingClassifier,
+                RandomForestClassifier,
+                VotingClassifier,
+            )
+            from sklearn.linear_model import LogisticRegression  # noqa: PLC0415
+
+            X = np.array([f for f, _ in self._buffer], dtype=np.float32)
+            y = np.array([lb for _, lb in self._buffer], dtype=np.int32)
+
+            gb = GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=0)
+            rf = RandomForestClassifier(n_estimators=30, max_depth=4, random_state=0)
+            lr = LogisticRegression(max_iter=300, class_weight="balanced")
+            vc = VotingClassifier(
+                estimators=[("gb", gb), ("rf", rf), ("lr", lr)],
+                voting="soft",
+            )
+            vc.fit(X, y)
+            self._model    = vc
+            self._is_ready = True
+            self._records_since_retrain = 0
+            logger.info(
+                "EnsembleScorer: VotingClassifier trained on %d samples", len(self._buffer)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("EnsembleScorer._train failed: %s", exc)
+
+
 # ── Thresholds ─────────────────────────────────────────────────────────── #
 
 _MIN_CONTINUATION = 0.35   # below this → HOLD
@@ -132,6 +272,7 @@ class DecisionEngine:
     def __init__(self, base_min_score: float = 0.25) -> None:
         self.tracker    = PerformanceTracker()
         self.controller = AdaptiveController(self.tracker, base_min_score)
+        self._ensemble  = EnsembleScorer()
 
         self._last_context: Optional[DecisionContext] = None
         self._atr_history: List[float] = []    # for ATR percentile
@@ -226,6 +367,7 @@ class DecisionEngine:
         )
         self.tracker.record(outcome)
         self.controller.adapt()
+        self._ensemble.label_pending(win=pnl > 0)
         logger.info(
             "DecisionEngine.record_outcome: %s/%s %s pnl=%.2f "
             "→ lot_scale=%.2f min_score=%.2f paused=%s",
@@ -350,6 +492,9 @@ class DecisionEngine:
             "pause_reason":       s.pause_reason,
             "adaptation_count":   s.adaptation_count,
             "mode_weight_adjs":   dict(s.mode_weight_adjs),
+            "ql_update_count":    self.controller._ql.update_count,
+            "ensemble_ready":     self._ensemble.is_ready,
+            "win_classifier_ready": self.tracker._classifier.is_ready,
         }
 
     # ── Internal helpers ───────────────────────────────────────────────── #
@@ -420,6 +565,29 @@ class DecisionEngine:
             vol_regime = "LOW"
 
         momentum_score = round(0.5 * ema_score + 0.5 * direction_score, 3)
+
+        # ── EnsembleScorer: blend ML prediction with rule-based prob ── #
+        gs = self.tracker.get_global_stats()
+        features = self._ensemble.extract_features(
+            ema_score        = ema_score,
+            direction_score  = direction_score,
+            wave_conf        = wa.confidence,
+            atr_percentile   = atr_percentile,
+            sub_wave_penalty = sub_penalty,
+            vol_regime       = vol_regime,
+            cons_losses      = self.tracker.get_consecutive_losses(),
+            global_wr        = gs.win_rate,
+            global_pf        = gs.profit_factor,
+        )
+        self._ensemble.record_pending(features)
+        ml_prob = self._ensemble.predict(features)
+        if ml_prob is not None:
+            # 50/50 blend while model is still building confidence
+            continuation_prob = round(0.5 * continuation_prob + 0.5 * ml_prob, 3)
+            logger.debug(
+                "EnsembleScorer: ml_prob=%.3f blended_cont=%.3f",
+                ml_prob, continuation_prob,
+            )
 
         return MarketRegime(
             continuation_prob=continuation_prob,

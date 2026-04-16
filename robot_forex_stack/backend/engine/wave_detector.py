@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -53,7 +53,185 @@ class WaveAnalysis:
     description: str = ""
 
 
+# ── LSTMWaveClassifier ────────────────────────────────────────────────────── #
+
+class LSTMWaveClassifier:
+    """
+    LSTM-based wave direction classifier (PyTorch).
+
+    Self-labelling training pipeline
+    ---------------------------------
+    1. On each ``analyse()`` call, ``record_sample(df, rule_wave_state)``
+       appends the last *_SEQ_LEN* normalised close prices together with
+       the rule-derived label to an internal buffer.
+    2. Once *_MIN_SAMPLES* labeled windows are collected (and every
+       *_RETRAIN_EVERY* new samples afterwards), ``fit_if_ready()`` trains
+       a small single-layer LSTM for 30 epochs.
+    3. ``predict_proba(df)`` returns P(BULL | BEAR | SIDEWAYS); the caller
+       blends this with the rule-based confidence score.
+
+    Graceful degradation
+    --------------------
+    If PyTorch is not installed the classifier silently stays inactive
+    (``is_ready == False``) and the system falls back to the purely
+    rule-based confidence.
+    """
+
+    _SEQ_LEN:      int = 30   # lookback window (close price bars)
+    _HIDDEN:       int = 32   # LSTM hidden units
+    _MIN_SAMPLES:  int = 50   # minimum labeled windows before first training
+    _RETRAIN_EVERY: int = 25  # retrain every N new samples
+    _EPOCHS:       int = 30   # training epochs per fit
+
+    # Label mapping: WaveState value → class index {0=BULL, 1=BEAR, 2=SIDEWAYS}
+    _LABEL_MAP: Dict[str, int] = {
+        "BULL_MAIN":    0,
+        "SUB_WAVE_UP":  0,
+        "BEAR_MAIN":    1,
+        "SUB_WAVE_DOWN": 1,
+        "SIDEWAYS":     2,
+    }
+
+    def __init__(self) -> None:
+        self._model: object = None
+        self._is_ready = False
+        self._buffer: List[Tuple[np.ndarray, int]] = []  # (seq, label)
+        self._records_since_retrain: int = 0
+
+        try:
+            import torch as _torch  # noqa: F401
+            self._torch_available = True
+        except ImportError:
+            self._torch_available = False
+            logger.info(
+                "LSTMWaveClassifier: torch not installed — LSTM disabled"
+            )
+
+    # ── Public API ──────────────────────────────────────────────────────── #
+
+    @property
+    def is_ready(self) -> bool:
+        return self._is_ready
+
+    def record_sample(self, df: pd.DataFrame, wave_state: WaveState) -> None:
+        """Collect one labeled training window from a rule-based analysis."""
+        if not self._torch_available:
+            return
+        seq = self._extract_sequence(df)
+        if seq is None:
+            return
+        label = self._LABEL_MAP.get(wave_state.value, 2)
+        self._buffer.append((seq, label))
+        self._records_since_retrain += 1
+
+    def fit_if_ready(self) -> None:
+        """Train LSTM when buffer has enough samples and enough new arrivals."""
+        if not self._torch_available:
+            return
+        if len(self._buffer) < self._MIN_SAMPLES:
+            return
+        if self._records_since_retrain < self._RETRAIN_EVERY and self._is_ready:
+            return
+        self._train()
+
+    def predict_proba(self, df: pd.DataFrame) -> Optional[Dict[str, float]]:
+        """
+        Return ``{'BULL': p, 'BEAR': p, 'SIDEWAYS': p}`` or ``None``.
+        The three probabilities sum to 1.0.
+        """
+        if not self._is_ready or self._model is None:
+            return None
+        seq = self._extract_sequence(df)
+        if seq is None:
+            return None
+        try:
+            import torch  # noqa: PLC0415
+            import torch.nn.functional as F  # noqa: PLC0415
+
+            x = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
+            self._model.eval()  # type: ignore[union-attr]
+            with torch.no_grad():
+                logits = self._model(x)  # type: ignore[operator]
+                probs  = F.softmax(logits, dim=-1).squeeze(0).numpy()
+            return {
+                "BULL":     round(float(probs[0]), 4),
+                "BEAR":     round(float(probs[1]), 4),
+                "SIDEWAYS": round(float(probs[2]), 4),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("LSTMWaveClassifier.predict_proba: %s", exc)
+            return None
+
+    # ── Internal helpers ─────────────────────────────────────────────────── #
+
+    def _extract_sequence(self, df: pd.DataFrame) -> Optional[np.ndarray]:
+        """Return the last *_SEQ_LEN* normalised close prices, or None."""
+        if len(df) < self._SEQ_LEN:
+            return None
+        closes = df["close"].iloc[-self._SEQ_LEN:].values.astype(np.float32)
+        mu, sigma = float(closes.mean()), float(closes.std())
+        if sigma < 1e-9:
+            return None
+        return (closes - mu) / sigma
+
+    def _train(self) -> None:
+        """Train a small single-layer LSTM on the current buffer."""
+        import torch  # noqa: PLC0415
+        import torch.nn as nn  # noqa: PLC0415
+
+        class _LSTMNet(nn.Module):
+            def __init__(self, hidden: int = 32) -> None:
+                super().__init__()
+                self.lstm = nn.LSTM(1, hidden, batch_first=True)
+                self.fc   = nn.Linear(hidden, 3)
+
+            def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+                _, (hn, _) = self.lstm(x)
+                return self.fc(hn.squeeze(0))
+
+        seqs   = torch.tensor(
+            np.array([s for s, _ in self._buffer]), dtype=torch.float32
+        ).unsqueeze(-1)  # (N, SEQ_LEN, 1)
+        labels = torch.tensor(
+            [lb for _, lb in self._buffer], dtype=torch.long
+        )
+
+        model   = _LSTMNet(hidden=self._HIDDEN)
+        opt     = torch.optim.Adam(model.parameters(), lr=1e-3)
+        loss_fn = nn.CrossEntropyLoss()
+
+        model.train()
+        last_loss = 0.0
+        for _ in range(self._EPOCHS):
+            opt.zero_grad()
+            out      = model(seqs)
+            loss     = loss_fn(out, labels)
+            loss.backward()
+            opt.step()
+            last_loss = float(loss)
+
+        self._model    = model
+        self._is_ready = True
+        self._records_since_retrain = 0
+        logger.info(
+            "LSTMWaveClassifier: trained on %d samples (loss=%.4f)",
+            len(self._buffer), last_loss,
+        )
+
+
 class WaveDetector:
+    """
+    Parameters
+    ----------
+    htf_ema_fast : int   Higher-TF fast EMA period (default 21)
+    htf_ema_slow : int   Higher-TF slow EMA period (default 50)
+    ltf_ema_fast : int   Lower-TF fast EMA period  (default 8)
+    ltf_ema_slow : int   Lower-TF slow EMA period  (default 21)
+    fractal_period : int Fractal lookback left + right bars (default 2)
+    sideways_atr_mult : float  Price range / ATR threshold for sideways (default 1.5)
+    sideways_candles : int     Min candles within range to call SIDEWAYS (default 10)
+    atr_period : int    ATR smoothing period (default 14)
+    """
     """
     Parameters
     ----------
@@ -88,6 +266,7 @@ class WaveDetector:
         self.atr_period = atr_period
 
         self._last_analysis: Optional[WaveAnalysis] = None
+        self._lstm = LSTMWaveClassifier()
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
@@ -151,6 +330,37 @@ class WaveDetector:
             sideways_detected=sideways,
             description=description,
         )
+
+        # ── LSTM: collect sample + optionally boost confidence ───────── #
+        self._lstm.record_sample(df, main_wave)
+        self._lstm.fit_if_ready()
+        lstm_probs = self._lstm.predict_proba(df)
+        if lstm_probs is not None:
+            # Map current main_wave to the LSTM class
+            wave_key = "SIDEWAYS" if sideways else (
+                "BULL" if main_wave == WaveState.BULL_MAIN else
+                "BEAR" if main_wave == WaveState.BEAR_MAIN else "SIDEWAYS"
+            )
+            lstm_conf = lstm_probs.get(wave_key, 0.5)
+            # Blend: 60% rule-based, 40% LSTM
+            blended_confidence = round(0.6 * confidence + 0.4 * lstm_conf, 3)
+            analysis = WaveAnalysis(
+                main_wave=analysis.main_wave,
+                sub_wave=analysis.sub_wave,
+                confidence=blended_confidence,
+                htf_ema_fast=analysis.htf_ema_fast,
+                htf_ema_slow=analysis.htf_ema_slow,
+                ltf_ema_fast=analysis.ltf_ema_fast,
+                ltf_ema_slow=analysis.ltf_ema_slow,
+                atr=analysis.atr,
+                swing_highs=analysis.swing_highs,
+                swing_lows=analysis.swing_lows,
+                sideways_detected=analysis.sideways_detected,
+                description=self._build_description(
+                    main_wave, sub_wave, sideways, blended_confidence
+                ),
+            )
+
         self._last_analysis = analysis
         return analysis
 
