@@ -194,11 +194,11 @@ PIPELINE_METRICS_WINDOW_SECONDS = 3600   # Tính metrics trên 1 giờ gần nh�
 # ============================================================
 
 # Số lệnh tối thiểu trên một mẫu (fingerprint) để xét luật cứng
-MEMORY_MIN_SAMPLES_FOR_RULE  = 5
+MEMORY_MIN_SAMPLES_FOR_RULE  = 3
 
 # Tỉ lệ thua tối thiểu để đưa fingerprint vào danh sách chặn cứng
 # Fingerprint có loss_rate >= ngưỡng này → luật cứng: BLOCK
-MEMORY_HARD_BLOCK_LOSS_RATE  = 0.70      # >= 70% thua → chặn cứng
+MEMORY_HARD_BLOCK_LOSS_RATE  = 0.40      # >= 40% thua → chặn cứng
 
 # Tỉ lệ thắng tốt để tăng ưu tiên (priority boost) cho fingerprint
 MEMORY_STRONG_WIN_RATE       = 0.65      # >= 65% thắng → bonus ưu tiên
